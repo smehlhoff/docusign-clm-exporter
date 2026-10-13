@@ -1,0 +1,43 @@
+# Python environments, bytecode, and build output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Lint, type-check, test, and coverage artifacts
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Local configuration and credentials
+config.toml
+.env
+.env.*
+!.env.example
+/.aws/
+/.ssh/
+*.pem
+*.key
+
+# Exporter output when the repository is used as the working directory
+/CLM-export/
+/work/
+/state/
+/reports/
+
+# Local agent tooling and generated analysis
+/.agents/
+/.codex/
+graphify-out/
+.graphify_cache/
+
+# OS metadata
+.DS_Store
+Thumbs.db

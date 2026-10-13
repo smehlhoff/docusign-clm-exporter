@@ -1,0 +1,184 @@
+import importlib.util
+import io
+import json
+import tempfile
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
+from pathlib import Path
+from unittest.mock import patch
+
+from clm_exporter.cli import execute, main
+from clm_exporter.config import Config
+from clm_exporter.errors import FatalError
+from clm_exporter.progress import Progress
+
+from .fakes import FakeRemote
+
+
+class Terminal(io.StringIO):
+    def isatty(self):
+        return True
+
+
+class RecordingBar:
+    def __init__(self, options):
+        self.options, self.n, self.closed = options, 0, False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.closed = True
+
+    def update(self, amount=1):
+        self.n += amount
+
+
+class RecordingTqdm:
+    def __init__(self):
+        self.bars, self.messages = [], []
+
+    def __call__(self, **options):
+        bar = RecordingBar(options)
+        self.bars.append(bar)
+        options["file"].write("\r" + options["desc"])
+        return bar
+
+    def write(self, message, file):
+        self.messages.append(message)
+        file.write(message + "\n")
+
+
+class ProgressTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        self.cfg = Config("simulated.test", "operator", root / "key", root / "known_hosts", "/", root / "working",
+                          max_staged_bytes=100, min_free_bytes=10, chunk_bytes=2)
+        self.remote = FakeRemote()
+        self.display = RecordingTqdm()
+        self.stderr = Terminal()
+        with redirect_stderr(self.stderr):
+            execute(self.cfg, "init")
+
+    def invoke(self, command="download", **kwargs):
+        with redirect_stderr(self.stderr), patch("clm_exporter.progress.load_tqdm", return_value=self.display):
+            return execute(self.cfg, command, remote_factory=self.remote.factory,
+                           free=kwargs.pop("free", lambda: 10000), sleep=lambda _: None, **kwargs)
+
+    def bars(self, unit):
+        return [bar for bar in self.display.bars if bar.options["unit"] == unit]
+
+    def test_scan_has_unknown_total_and_transfer_counts_written_bytes(self):
+        self.remote.add("dir/a.pdf", b"12345")
+        self.remote.add("dir/not.txt")
+        code, _ = self.invoke()
+        self.assertEqual(code, 0)
+        scan = self.bars("entry")[0]
+        self.assertIsNone(scan.options["total"])
+        self.assertEqual(scan.n, 3)
+        self.assertNotIn("remaining", scan.options["bar_format"])
+        files = self.bars("file")[0]
+        self.assertEqual((files.n, files.options["total"]), (1, 1))
+        byte_bar = self.bars("B")[0]
+        self.assertEqual((byte_bar.n, byte_bar.options["total"]), (5, 5))
+        self.assertEqual(byte_bar.options["unit_divisor"], 1000)
+        self.assertTrue(all(bar.closed for bar in self.display.bars))
+
+    def test_retry_starts_new_bar_with_updated_size(self):
+        self.remote.add("a.pdf", b"old")
+        def change(path, offset):
+            if offset == 2:
+                self.remote.add(path, b"newer", 2)
+                self.remote.read_hook = None
+        self.remote.read_hook = change
+        self.assertEqual(self.invoke()[0], 0)
+        first, second = self.bars("B")
+        self.assertEqual((first.n, first.options["total"]), (3, 3))
+        self.assertEqual((second.n, second.options["total"]), (5, 5))
+        self.assertIn("attempt 2", second.options["desc"])
+        self.assertEqual(self.bars("file")[0].n, 1)
+        self.assertTrue(all(bar.closed for bar in self.display.bars))
+
+    def test_capacity_stop_keeps_deferred_file_out_of_processed_count(self):
+        self.cfg = replace(self.cfg, max_staged_bytes=4)
+        self.remote.add("a.pdf", b"1234")
+        self.remote.add("b.pdf", b"5678")
+        code, summary = self.invoke()
+        self.assertEqual((code, summary["stop_reason"]), (0, "batch_capacity"))
+        files = self.bars("file")[0]
+        self.assertEqual((files.n, files.options["total"]), (1, 2))
+        self.assertEqual(len(self.bars("B")), 1)
+        self.assertTrue(all(bar.closed for bar in self.display.bars))
+
+    def test_interrupt_closes_partial_bars(self):
+        self.remote.add("a.pdf", b"1234")
+        def interrupt(path, offset):
+            if offset == 2:
+                raise KeyboardInterrupt
+        self.remote.read_hook = interrupt
+        self.assertEqual(self.invoke()[0], 130)
+        self.assertEqual(self.bars("B")[0].n, 2)
+        self.assertEqual(self.bars("file")[0].n, 0)
+        self.assertTrue(all(bar.closed for bar in self.display.bars))
+        self.assertFalse(list(self.cfg.work.iterdir()))
+
+    def test_zero_byte_pdf_and_failure_count_processed_not_successes(self):
+        self.remote.add("a.pdf", b"")
+        self.remote.add("b.pdf")
+        self.remote.open_hook = lambda path: (_ for _ in ()).throw(PermissionError("denied")) if path == "b.pdf" else None
+        code, summary = self.invoke()
+        self.assertEqual(code, 2)
+        self.assertEqual(summary["new_successes"], 1)
+        self.assertEqual(self.bars("file")[0].n, 2)
+        self.assertEqual(self.bars("B")[0].options["total"], 0)
+        self.assertEqual(self.bars("B")[0].n, 0)
+        self.assertTrue(all(bar.closed for bar in self.display.bars))
+
+    def test_nonterminal_and_opt_out_do_not_require_tqdm(self):
+        self.remote.add("a.pdf")
+        for stream, progress in ((io.StringIO(), True), (Terminal(), False)):
+            with self.subTest(progress=progress), redirect_stderr(stream), patch("clm_exporter.progress.load_tqdm", side_effect=AssertionError("must not import")):
+                code, _ = execute(self.cfg, "inventory", remote_factory=self.remote.factory, progress=progress)
+            self.assertEqual(code, 0)
+            self.assertNotIn("\r", stream.getvalue())
+
+    def test_interactive_cli_keeps_stdout_json_and_file_logs_clean(self):
+        self.remote.add("line\nbreak.pdf")
+        stdout = io.StringIO()
+        def run(cfg, command, *args, **kwargs):
+            return execute(cfg, command, *args, remote_factory=self.remote.factory, **kwargs)
+        with redirect_stdout(stdout), redirect_stderr(self.stderr), patch("clm_exporter.cli.load", return_value=self.cfg), \
+             patch("clm_exporter.cli.execute", side_effect=run), patch("clm_exporter.progress.load_tqdm", return_value=self.display):
+            code = main(["download", "--config", "unused.toml"])
+        summary = json.loads(stdout.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(summary["new_successes"], 1)
+        self.assertIn("Scanning", self.stderr.getvalue())
+        self.assertTrue(self.display.messages)
+        self.assertNotIn("\r", Path(summary["reports"]["log"]).read_text())
+        self.assertIn("\\n", self.bars("B")[0].options["desc"])
+        self.assertNotIn("\n", self.bars("B")[0].options["desc"])
+
+    def test_cli_no_progress_flag(self):
+        with redirect_stdout(io.StringIO()), patch("clm_exporter.cli.load", return_value=self.cfg), \
+             patch("clm_exporter.cli.execute", return_value=(0, {})) as run:
+            self.assertEqual(main(["download", "--config", "unused.toml", "--no-progress"]), 0)
+        self.assertFalse(run.call_args.kwargs["progress"])
+
+    def test_missing_tqdm_has_actionable_error(self):
+        with patch.dict("sys.modules", {"tqdm": None}), self.assertRaisesRegex(FatalError, "requirements.txt or use --no-progress"):
+            Progress(stream=Terminal())
+
+    @unittest.skipUnless(importlib.util.find_spec("tqdm"), "tqdm is not installed; real rendering test unavailable")
+    def test_real_tqdm_renders_to_terminal_and_closes(self):
+        from tqdm import tqdm
+        stream = Terminal()
+        display = Progress(stream=stream)
+        with display.bar(desc="Reading", total=4, unit="B", unit_scale=True) as bar:
+            bar.update(4)
+        self.assertIn("Reading", stream.getvalue())
+        self.assertIn("100%", stream.getvalue())
+        self.assertNotIn(bar, tqdm._instances)

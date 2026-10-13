@@ -1,0 +1,66 @@
+# Docusign CLM PDF exporter
+
+Download PDFs from CLM over SFTP, preserving folders and download history across
+download batches. Requires macOS or Linux and Python 3.12+.
+
+From this directory:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install .
+mkdir -p ~/clm-export
+cp config.example.toml ~/clm-export/config.toml
+```
+
+Edit the config with your SFTP host, username, RSA key, trusted `known_hosts` file,
+and remote root. Encrypted keys prompt for a passphrase. Add the verified server
+host key to `known_hosts` before connecting.
+
+Keep the working directory outside synced folders. Defaults allow **350 GB** of
+staged files, including temporary downloads, while preserving **50 GB** of free
+disk space. Both limits are configurable and use decimal GB.
+
+Initialize once, then download:
+
+```bash
+python -m clm_exporter init --config ~/clm-export/config.toml
+python -m clm_exporter download --config ~/clm-export/config.toml
+```
+
+Repeat `download` for later batches. It skips unchanged completed files even after
+local cleanup, downloads files whose size or modification time changed, and retries
+unfinished work. Keep `state/`; never reinitialize between batches.
+
+Use these commands with the same `--config` option:
+
+| Command | Purpose |
+| --- | --- |
+| `inventory` | Scan the source without downloading content |
+| `status` | Verify staged files, refresh reports, and back up state offline |
+| `reconcile` | Scan for remaining download gaps |
+
+Add `--no-progress` to hide progress bars. To request another copy of a completed
+file, add `--force-path 'Customers/Acme/Agreement.pdf'` to `download`; other pending
+files are still processed.
+
+For each batch:
+
+1. Run `download`, review its summary, then run `status` before offloading.
+2. Copy `~/clm-export/CLM-export` to your archive in a new `Batch 1`, `Batch 2`,
+   etc. folder.
+3. Include the latest `run-<id>-staging.csv` and `path-map.csv` from `reports/`.
+4. Verify the archived copy and keep a separate state backup. While the exporter is
+   stopped, delete the offloaded local PDFs, retaining `state/` and `reports/`.
+
+After CLM changes stop, repeat downloading and offloading, then run `reconcile`.
+Archive copying and verification are manual. A capacity stop leaves work pending;
+it does not mean the export is complete.
+
+Logs, CSV manifests, unresolved errors, and JSON summaries live in `reports/`.
+Exit codes: `0` success or planned capacity stop; `2` unresolved errors or
+reconciliation gaps; `1` fatal error; `130` interrupted.
+
+Run tests with `python -m unittest discover -v`. For the optional synthetic pilot,
+run `python -m tests.synthetic_pilot`; add `--output /tmp/clm-pilot.json` to save
+results.
