@@ -7,7 +7,7 @@ known_hosts_path = "~/.ssh/known_hosts"
 remote_root = "/your-remote-root"
 
 [local]
-working_directory = "~/clm-export"
+working_directory = "./export"
 export_folder_name = "CLM-export"
 
 [limits]

@@ -27,6 +27,7 @@ config.toml
 *.key
 
 # Exporter output when the repository is used as the working directory
+/export/
 /CLM-export/
 /work/
 /state/

@@ -9,13 +9,17 @@ From this directory:
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install .
-mkdir -p ~/clm-export
-cp config.example.toml ~/clm-export/config.toml
+cp config.example.toml config.toml
 ```
 
 Edit the config with your SFTP host, username, RSA key, trusted `known_hosts` file,
 and remote root. Encrypted keys prompt for a passphrase. Add the verified server
 host key to `known_hosts` before connecting.
+
+Keep `config.toml` in the project root. Its `working_directory = "./export"`
+setting puts downloads, state, and reports in the project's `export/` folder,
+which is created automatically. Relative paths resolve from the config file's
+folder. Both `config.toml` and `export/` are ignored by Git.
 
 Keep the working directory outside synced folders. Defaults allow **350 GB** of
 staged files, including temporary downloads, while preserving **50 GB** of free
@@ -24,8 +28,8 @@ disk space. Both limits are configurable and use decimal GB.
 Initialize once, then download:
 
 ```bash
-python -m clm_exporter init --config ~/clm-export/config.toml
-python -m clm_exporter download --config ~/clm-export/config.toml
+python -m clm_exporter init --config ./config.toml
+python -m clm_exporter download --config ./config.toml
 ```
 
 Repeat `download` for later batches. It skips unchanged completed files even after
@@ -47,9 +51,9 @@ files are still processed.
 For each batch:
 
 1. Run `download`, review its summary, then run `status` before offloading.
-2. Copy `~/clm-export/CLM-export` to your archive in a new `Batch 1`, `Batch 2`,
+2. Copy `export/CLM-export` to your archive in a new `Batch 1`, `Batch 2`,
    etc. folder.
-3. Include the latest `run-<id>-staging.csv` and `path-map.csv` from `reports/`.
+3. Include the latest `run-<id>-staging.csv` and `path-map.csv` from `export/reports/`.
 4. Verify the archived copy and keep a separate state backup. While the exporter is
    stopped, delete the offloaded local PDFs, retaining `state/` and `reports/`.
 
@@ -57,7 +61,7 @@ After CLM changes stop, repeat downloading and offloading, then run `reconcile`.
 Archive copying and verification are manual. A capacity stop leaves work pending;
 it does not mean the export is complete.
 
-Logs, CSV manifests, unresolved errors, and JSON summaries live in `reports/`.
+Logs, CSV manifests, unresolved errors, and JSON summaries live in `export/reports/`.
 Exit codes: `0` success or planned capacity stop; `2` unresolved errors or
 reconciliation gaps; `1` fatal error; `130` interrupted.
 

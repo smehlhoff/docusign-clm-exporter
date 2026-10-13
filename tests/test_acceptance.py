@@ -1034,7 +1034,7 @@ class ConfigTests(unittest.TestCase):
     def test_actual_cli_missing_state(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.toml"
-            example = (Path(__file__).parents[1] / "config.example.toml").read_text().replace('"~/clm-export"', json.dumps(temp + "/new"))
+            example = (Path(__file__).parents[1] / "config.example.toml").read_text().replace('"./export"', json.dumps(temp + "/new"))
             path.write_text(example)
             with redirect_stderr(io.StringIO()):
                 self.assertEqual(main(["status", "--config", str(path)]), 1)
