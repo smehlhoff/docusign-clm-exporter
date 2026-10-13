@@ -1,16 +1,19 @@
 # Docusign CLM PDF exporter
 
 Download PDFs from CLM over SFTP, preserving folders and download history across
-download batches. Requires macOS or Linux and Python 3.12+.
+download batches. Requires macOS or Linux and [uv](https://docs.astral.sh/uv/getting-started/installation/).
+The commands below use uv to install and run Python 3.12.
 
 From this directory:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install .
+uv python install 3.12
+uv sync --python 3.12
 cp config.example.toml config.toml
 ```
+
+uv manages `.venv` and installs the project dependencies. No environment
+activation is needed. If you already have `config.toml`, keep it and skip the copy.
 
 Edit the config with your SFTP host, username, RSA key, trusted `known_hosts` file,
 and remote root. Encrypted keys prompt for a passphrase. Add the verified server
@@ -28,8 +31,8 @@ disk space. Both limits are configurable and use decimal GB.
 Initialize once, then download:
 
 ```bash
-python -m clm_exporter init --config ./config.toml
-python -m clm_exporter download --config ./config.toml
+uv run --python 3.12 python -m clm_exporter init --config ./config.toml
+uv run --python 3.12 python -m clm_exporter download --config ./config.toml
 ```
 
 Repeat `download` for later batches. It skips unchanged completed files even after
@@ -37,6 +40,12 @@ local cleanup, downloads files whose size or modification time changed, and retr
 unfinished work. Keep `state/`; never reinitialize between batches.
 
 Use these commands with the same `--config` option:
+
+```bash
+uv run --python 3.12 python -m clm_exporter inventory --config ./config.toml
+uv run --python 3.12 python -m clm_exporter status --config ./config.toml
+uv run --python 3.12 python -m clm_exporter reconcile --config ./config.toml
+```
 
 | Command | Purpose |
 | --- | --- |
@@ -65,6 +74,14 @@ Logs, CSV manifests, unresolved errors, and JSON summaries live in `export/repor
 Exit codes: `0` success or planned capacity stop; `2` unresolved errors or
 reconciliation gaps; `1` fatal error; `130` interrupted.
 
-Run tests with `python -m unittest discover -v`. For the optional synthetic pilot,
-run `python -m tests.synthetic_pilot`; add `--output /tmp/clm-pilot.json` to save
-results.
+Run tests:
+
+```bash
+uv run --python 3.12 python -m unittest discover -v
+```
+
+For the optional synthetic pilot:
+
+```bash
+uv run --python 3.12 python -m tests.synthetic_pilot --output /tmp/clm-pilot.json
+```
