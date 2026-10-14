@@ -56,6 +56,7 @@ class AdapterTests(unittest.TestCase):
         self.client = Mock()
         self.client.get_transport().get_remote_server_key().asbytes.return_value = b"trusted-public-key"
         self.module = SimpleNamespace(SSHClient=Mock(return_value=self.client), RSAKey=Mock(), RejectPolicy=type("RejectPolicy", (), {}),
+                                      hostkeys=SimpleNamespace(InvalidHostKey=type("InvalidHostKey", (Exception,), {})),
                                       SSHException=SSHException, PasswordRequiredException=PasswordRequiredException,
                                       AuthenticationException=AuthenticationException, BadHostKeyException=BadHostKeyException)
         self.context = patch.dict("sys.modules", {"paramiko": self.module})
@@ -130,9 +131,9 @@ class AdapterTests(unittest.TestCase):
             patch.dict("sys.modules", {"paramiko.sftp": protocol}),
             self.assertRaisesRegex(ConnectionError, "close") as failure,
         ):
-            remote.check_directory("dir.pdf")
+            remote.check_directory("dir")
         self.assertEqual(sftp._request.call_args_list, [
-            call(protocol.CMD_OPENDIR, "/root/dir.pdf"),
+            call(protocol.CMD_OPENDIR, "/root/dir"),
             call(protocol.CMD_CLOSE, b"directory-handle"),
         ])
         remote.reconnect(failure.exception)

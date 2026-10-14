@@ -72,8 +72,11 @@ class Transfers:
         temp.unlink()
         self.capacity.removed(size)
 
-    def get_job(self, job_id: int) -> Row | None:
-        return self.db.execute("SELECT * FROM transfers WHERE id=?", (job_id,)).fetchone()
+    def get_job(self, job_id: int) -> Row:
+        job = self.db.execute("SELECT * FROM transfers WHERE id=?", (job_id,)).fetchone()
+        if job is None:
+            raise FatalError(f"Transfer record is missing: {job_id}")
+        return job
 
     def finalize(self, job: Row, path: Row) -> None:
         with self.state.transaction():
@@ -163,7 +166,6 @@ class Transfers:
         """Retry a pending file while retaining any durable ready payload."""
         job = self.db.execute("SELECT * FROM transfers WHERE path_id=? AND state IN ('pending','failed')", (path["id"],)).fetchone()
         for attempt in range(1, self.cfg.max_attempts + 1):
-            ready = False
             try:
                 with self.state.transaction():
                     self.db.execute("UPDATE transfers SET attempts=?,attempt_run=? WHERE id=?", (attempt, self.run, job["id"]))
@@ -200,17 +202,21 @@ class Transfers:
                 job = self.get_job(job_id)
                 self.checkpoint("downloading", job)
                 self._receive_payload(job, path, attempt, size, mtime)
-                ready = True
                 job = self.get_job(job_id)
                 self.checkpoint("ready", job)
                 self.promote(job, path)
                 LOG.info("Downloaded %r -> %r (%d bytes)%s", path["remote"], path["local"], size, " [zero-byte PDF: review]" if size == 0 else "")
                 return
             except (CapacityStop, KeyboardInterrupt):
-                if not ready:
+                # An interrupt can arrive after the ready COMMIT but before
+                # _receive_payload returns. Durable state governs cleanup.
+                job = self.get_job(job["id"])
+                if job["state"] not in ("ready", "downloaded"):
                     self.discard(job, "pending")
                 raise
             except (OSError, EOFError, MetadataError, PathError, SourceChanged) as exc:
+                job = self.get_job(job["id"])
+                ready = job["state"] in ("ready", "downloaded")
                 if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
                     if not ready:
                         self.discard(job, "pending")

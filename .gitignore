@@ -9,7 +9,6 @@ dist/
 
 # Lint, type-check, test, and coverage artifacts
 .ruff_cache/
-.mypy_cache/
 .pytest_cache/
 .coverage
 .coverage.*
@@ -38,6 +37,9 @@ config.toml
 /.codex/
 graphify-out/
 .graphify_cache/
+
+# Local documentation
+/docs/
 
 # OS metadata
 .DS_Store

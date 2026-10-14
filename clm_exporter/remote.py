@@ -99,7 +99,7 @@ class Remote:
             try:
                 try:
                     client.load_host_keys(str(cfg.known_hosts_path))
-                except (OSError, p.SSHException) as exc:
+                except (OSError, p.SSHException, p.hostkeys.InvalidHostKey, ValueError) as exc:
                     raise FatalError("Cannot load the configured known_hosts file") from exc
                 client.set_missing_host_key_policy(RejectUnknown())
                 client.connect(hostname=cfg.host, port=cfg.port, username=cfg.username,

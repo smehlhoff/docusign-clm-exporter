@@ -35,10 +35,10 @@ class ProtocolTests(unittest.TestCase):
             (source / "Example.PDF").write_bytes(b"fixture content selected by extension")
             pdfs = ["Example.PDF"]
             if directory_mode is not None:
-                nested = "System Admin/Templates.pdf/1/2/3/test.pdf"
+                nested = "System Admin/Templates/1/2/3/test.pdf"
                 (source / nested).parent.mkdir(parents=True)
                 (source / nested).write_bytes(b"nested PDF")
-                (source / "System Admin/Templates.pdf/Empty").mkdir()
+                (source / "System Admin/Templates/Empty").mkdir()
                 pdfs.append(nested)
 
             release = threading.Event()
@@ -194,6 +194,28 @@ class ProtocolTests(unittest.TestCase):
         for stage in ("version", "request"):
             with self.subTest(stage=stage):
                 self.exercise(stall=stage)
+
+    def test_malformed_known_hosts_is_reported_and_backed_up(self):
+        import paramiko as p
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            key, known = root / "key", root / "known_hosts"
+            p.RSAKey.generate(2048).write_private_key_file(str(key))
+            cfg = Config("sftp.test", "operator", key, known, "/", root / "working", min_free_bytes=0)
+            with redirect_stderr(io.StringIO()):
+                execute(cfg, "init", progress=False)
+            for content in (b"sftp.test ssh-rsa a\n", b"\xff\n"):
+                with self.subTest(content=content):
+                    known.write_bytes(content)
+                    with patch.object(p.SSHClient, "connect") as connect, redirect_stderr(io.StringIO()) as stderr:
+                        code, summary = execute(cfg, "download", progress=False)
+                    connect.assert_not_called()
+                    self.assertEqual(code, 1)
+                    self.assertEqual(summary["stop_reason"], "fatal_error")
+                    self.assertIn("Cannot load the configured known_hosts file", stderr.getvalue())
+                    self.assertTrue(Path(summary["reports"]["summary"]).exists())
+                    self.assertTrue(Path(summary["reports"]["backup"]).exists())
 
     def test_invalid_utf8_filename_retains_partial_scan_and_reports_error(self):
         self.exercise(invalid_name=True)

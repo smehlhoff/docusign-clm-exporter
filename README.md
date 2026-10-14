@@ -1,19 +1,16 @@
 # Docusign CLM PDF exporter
 
-Download PDFs from CLM over SFTP, preserving folders and download history across
-download batches. Requires macOS or Linux and [uv](https://docs.astral.sh/uv/getting-started/installation/).
-The commands below use uv to install and run Python 3.12.
+Download CLM PDFs over SFTP, preserving folders and download history across
+batches. Requires macOS or Linux, Python 3.12+, and
+[uv](https://docs.astral.sh/uv/getting-started/installation/).
 
-PDFs are selected by a case-insensitive `.pdf` filename ending. SFTP file-type
-labels do not exclude PDFs; directories are traversed, including those named
-with a `.pdf` ending. Downloads still require valid size and modification time.
-For entries labeled `special` or missing a type, inventory checks `lstat`
-and, if still ambiguous, opens and immediately closes a directory handle to
-confirm traversal, including folders ending in `.pdf`. Permission and connection
-failures make the scan incomplete. SFTP v3 can reject a directory check on a file
-with a generic failure or "no such file"; PDFs remain download candidates after
-these responses. Other unverified entries make the scan incomplete.
-Known directory symlinks are not traversed.
+`inventory`, `download`, and `reconcile` share the same recursive scan. PDFs are
+selected by a case-insensitive `.pdf` suffix and require valid size and modification
+time. PDFs reuse listing metadata, requesting `lstat` only when size or modification
+time is missing; ambiguous types do not require directory probing. For other entries
+reported as `special` or missing a type, the scan checks `lstat`, then briefly opens
+a directory handle if the type remains unclear. Unverified entries and scan failures
+are reported as incomplete. Known directory symlinks are not traversed.
 
 From this directory:
 
@@ -23,21 +20,19 @@ uv sync --python 3.12
 cp config.example.toml config.toml
 ```
 
-uv manages `.venv` and installs the project dependencies. No environment
-activation is needed. If you already have `config.toml`, keep it and skip the copy.
+Skip the copy if `config.toml` already exists. uv manages the environment and dependencies.
 
-Edit the config with your SFTP host, username, RSA key, trusted `known_hosts` file,
-and remote root. Encrypted keys prompt for a passphrase. Add the verified server
-host key to `known_hosts` before connecting.
+Set your SFTP host, username, RSA key, trusted `known_hosts` file, and remote root
+in the config. Verify and add the server host key before connecting. Encrypted RSA
+keys prompt for a passphrase.
 
-Keep `config.toml` in the project root. Its `working_directory = "./export"`
-setting puts downloads, state, and reports in the project's `export/` folder,
-which is created automatically. Relative paths resolve from the config file's
-folder. Both `config.toml` and `export/` are ignored by Git.
+Relative paths resolve from the config file's folder. The default
+`working_directory = "./export"` creates downloads, state, and reports under
+`export/`. Both `config.toml` and `export/` are ignored by Git.
 
-Keep the working directory outside synced folders. Defaults allow **350 GB** of
-staged files, including temporary downloads, while preserving **50 GB** of free
-disk space. Both limits are configurable and use decimal GB.
+Keep the working directory outside synced folders. Configurable defaults allow
+**350 GB** of staged files, including temporary downloads, and reserve **50 GB** of
+free disk space (decimal GB).
 
 Initialize once, then download:
 
@@ -46,20 +41,12 @@ uv run --python 3.12 python -m clm_exporter init --config ./config.toml
 uv run --python 3.12 python -m clm_exporter download --config ./config.toml
 ```
 
-`init` leaves `reports/` empty. It prints its summary to the terminal and saves
-the database and its backup under `state/`.
+`init` creates the database and backup under `state/`, leaving `reports/` empty.
+Repeat `download` for later batches: it skips unchanged completed files even after
+local cleanup, downloads changed files, and retries unfinished work.
+**Keep `state/`; never reinitialize between batches.**
 
-Repeat `download` for later batches. It skips unchanged completed files even after
-local cleanup, downloads files whose size or modification time changed, and retries
-unfinished work. Keep `state/`; never reinitialize between batches.
-
-Use these commands with the same `--config` option:
-
-```bash
-uv run --python 3.12 python -m clm_exporter inventory --config ./config.toml
-uv run --python 3.12 python -m clm_exporter status --config ./config.toml
-uv run --python 3.12 python -m clm_exporter reconcile --config ./config.toml
-```
+Replace `download` in the command above with:
 
 | Command | Purpose |
 | --- | --- |
@@ -67,27 +54,24 @@ uv run --python 3.12 python -m clm_exporter reconcile --config ./config.toml
 | `status` | Verify staged files, refresh reports, and back up state offline |
 | `reconcile` | Scan for remaining download gaps |
 
-Add `--no-progress` to hide progress bars. To request another copy of a completed
-file, add `--force-path 'Customers/Acme/Agreement.pdf'` to `download`; other pending
-files are still processed.
+Use `--no-progress` to hide progress bars. Add
+`--force-path 'Customers/Acme/Agreement.pdf'` to `download` to repeat a completed
+file; other pending files are still processed.
 
 For each batch:
 
 1. Run `download`, review its summary, then run `status` before offloading.
-2. Copy `export/CLM-export` to your archive in a new `Batch 1`, `Batch 2`,
-   etc. folder.
+2. Copy `export/CLM-export` to a new archive folder for that batch.
 3. Include the latest `run-<id>-staging.csv` and `path-map.csv` from `export/reports/`.
 4. Verify the archived copy and keep a separate state backup. While the exporter is
    stopped, delete the offloaded local PDFs, retaining `state/` and `reports/`.
 
-After CLM changes stop, repeat downloading and offloading, then run `reconcile`.
-Archive copying and verification are manual. A capacity stop leaves work pending;
-it does not mean the export is complete.
+After CLM changes stop, finish downloading and offloading, then run `reconcile`.
+Archive copying and verification are manual. A capacity stop leaves work pending.
 
-Logs, CSV manifests, unresolved errors, and JSON summaries live in `export/reports/`.
-Inventory logs show discovery counts, warnings, and errors. JSON summaries include
-`directories_discovered`: distinct directories observed in the reported scan,
-including empty folders and excluding the configured remote root.
+Logs, CSV manifests, errors, and JSON summaries live in `export/reports/`.
+`directories_discovered` counts distinct folders seen in the scan, including empty
+folders and excluding the remote root.
 Exit codes: `0` success or planned capacity stop; `2` unresolved errors or
 reconciliation gaps; `1` fatal error; `130` interrupted.
 
@@ -97,7 +81,7 @@ Run tests:
 uv run --python 3.12 python -m unittest discover -v
 ```
 
-For the optional synthetic pilot:
+Optional synthetic pilot:
 
 ```bash
 uv run --python 3.12 python -m tests.synthetic_pilot --output /tmp/clm-pilot.json

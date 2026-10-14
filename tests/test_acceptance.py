@@ -393,10 +393,47 @@ class ExportTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual((self.cfg.export / path).read_bytes(), b"pdf")
 
-    def test_pdf_named_directories_with_ambiguous_types_are_traversed(self):
+    def test_pdf_listing_metadata_avoids_redundant_stat(self):
+        for name, mode in (("missing.pdf", None), ("permissions.PDF", 0o600), ("special.pdf", 0o140640)):
+            self.remote.add(name)
+            self.remote.reported_modes[name] = mode
+        with patch.object(self.remote, "lstat", wraps=self.remote.lstat) as lstat:
+            code, summary = self.invoke("inventory")
+        self.assertEqual(code, 0)
+        self.assertEqual(summary["pdfs_discovered"], 3)
+        self.assertEqual([c.args[0] for c in lstat.call_args_list], [""])
+
+        with patch.object(self.remote, "lstat", wraps=self.remote.lstat) as lstat:
+            code, summary = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertTrue(summary["local_download_complete"])
+        # Each payload still has metadata checked before and after reading.
+        self.assertEqual([c.args[0] for c in lstat.call_args_list],
+                         ["", "missing.pdf", "missing.pdf", "permissions.PDF", "permissions.PDF", "special.pdf", "special.pdf"])
+
+    def test_pdf_missing_listing_metadata_still_uses_stat(self):
+        for name in ("size.pdf", "mtime.pdf"):
+            self.remote.add(name)
+            self.remote.reported_modes[name] = 0o140640
+        original = self.remote.iterdir
+
+        def incomplete_listing(directory):
+            for entry in original(directory):
+                setattr(entry, "st_size" if entry.filename == "size.pdf" else "st_mtime", None)
+                yield entry
+
+        self.remote.iterdir = incomplete_listing
+        with patch.object(self.remote, "lstat", wraps=self.remote.lstat) as lstat:
+            code, summary = self.invoke("inventory")
+        self.assertEqual(code, 0)
+        self.assertTrue(summary["scan_complete"])
+        self.assertEqual(summary["pdfs_discovered"], 2)
+        self.assertEqual([c.args[0] for c in lstat.call_args_list], ["", "mtime.pdf", "size.pdf"])
+
+    def test_all_online_commands_probe_ambiguous_folders_but_not_pdfs(self):
         pdfs = []
         for label, mode in (("missing", None), ("permissions", 0o750), ("special", 0o140750)):
-            folder = f"{label}.PDF"
+            folder = label
             nested = f"{folder}/nested/contract.pdf"
             document = f"{label}-document.pdf"
             self.remote.add(nested)
@@ -404,27 +441,31 @@ class ExportTests(unittest.TestCase):
             self.remote.reported_modes.update({folder: mode, document: mode})
             pdfs.extend([nested, document])
 
-        code, summary = self.invoke("inventory")
-        self.assertEqual(code, 0)
-        self.assertTrue(summary["scan_complete"])
-        self.assertEqual(summary["directories_discovered"], 6)
-        self.assertEqual(summary["pdfs_discovered"], len(pdfs))
-        self.assertFalse(self.remote.opens)
-        code, summary = self.invoke()
-        self.assertEqual(code, 0)
-        self.assertTrue(summary["local_download_complete"])
+        for command in ("inventory", "download", "reconcile"):
+            with self.subTest(command=command):
+                with patch.object(self.remote, "check_directory", wraps=self.remote.check_directory) as probe:
+                    code, summary = self.invoke(command)
+                self.assertEqual(code, 0)
+                self.assertTrue(summary["scan_complete"])
+                self.assertEqual(summary["directories_discovered"], 6)
+                self.assertEqual(summary["pdfs_discovered"], len(pdfs))
+                self.assertEqual([c.args[0] for c in probe.call_args_list], ["missing", "permissions", "special"])
+                if command == "inventory":
+                    self.assertFalse(self.remote.opens)
+                else:
+                    self.assertTrue(summary["local_download_complete"])
         self.assertEqual(self.remote.opens, sorted(pdfs))
         for path in pdfs:
             with self.subTest(path=path):
                 self.assertEqual((self.cfg.export / path).read_bytes(), b"pdf")
 
-    def test_pdf_directory_probe_failures_remain_visible_and_recoverable(self):
-        self.remote.add("folder.pdf/contract.pdf")
-        self.remote.reported_modes["folder.pdf"] = 0o140750
+    def test_directory_probe_failures_remain_visible_and_recoverable(self):
+        self.remote.add("folder/contract.pdf")
+        self.remote.reported_modes["folder"] = 0o140750
         for failure in (PermissionError("denied"), ConnectionError("dropped")):
             with self.subTest(failure=type(failure).__name__):
                 with patch.object(self.remote, "check_directory", side_effect=failure):
-                    code, summary = self.invoke("inventory")
+                    code, summary = self.invoke("download")
                 self.assertEqual(code, 2)
                 self.assertFalse(summary["scan_complete"])
                 self.assertEqual(summary["unresolved_directory_errors"], 1)
@@ -432,7 +473,7 @@ class ExportTests(unittest.TestCase):
                 code, summary = self.invoke()
                 self.assertEqual(code, 0)
                 self.assertTrue(summary["local_download_complete"])
-                self.assertEqual((self.cfg.export / "folder.pdf/contract.pdf").read_bytes(), b"pdf")
+                self.assertEqual((self.cfg.export / "folder/contract.pdf").read_bytes(), b"pdf")
                 self.remote.opens.clear()
 
     def test_unavailable_before_success_is_not_hidden(self):
@@ -501,7 +542,7 @@ class ExportTests(unittest.TestCase):
                     self.remote.opens.clear()
 
     def test_special_listing_uses_stat_before_skipping_or_probing(self):
-        self.remote.add("System Admin/Templates.pdf/test.pdf")
+        self.remote.add("System Admin/Templates/test.pdf")
         self.remote.add("System Admin/Link", kind="symlink")
         self.remote.add("System Admin/Link/hidden.pdf")
         original_list = self.remote.iterdir
@@ -516,9 +557,9 @@ class ExportTests(unittest.TestCase):
             code, summary = self.invoke()
         self.assertEqual(code, 0)
         self.assertTrue(summary["scan_complete"])
-        self.assertEqual(self.remote.opens, ["System Admin/Templates.pdf/test.pdf"])
+        self.assertEqual(self.remote.opens, ["System Admin/Templates/test.pdf"])
         self.assertEqual(summary["directories_discovered"], 2)
-        self.assertEqual((self.cfg.export / "System Admin/Templates.pdf/test.pdf").read_bytes(), b"pdf")
+        self.assertEqual((self.cfg.export / "System Admin/Templates/test.pdf").read_bytes(), b"pdf")
 
     def test_reclassified_directories_resolve_scan_errors_but_keep_download_gaps(self):
         self.remote.add("empty", kind="directory")
@@ -818,6 +859,82 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(self.invoke()[0], 0)
         self.assertEqual((self.cfg.export / "a.pdf").read_bytes(), b"new")
         self.assertEqual(len(self.remote.opens), 2)
+
+    def test_interrupt_after_ready_commit_preserves_payload_for_recovery(self):
+        from clm_exporter.transfer import Transfers
+
+        self.remote.add("a.pdf", b"only copy")
+        receive = Transfers._receive_payload
+
+        def interrupt_after_commit(transfers, *args):
+            receive(transfers, *args)
+            raise KeyboardInterrupt
+
+        with patch.object(Transfers, "_receive_payload", interrupt_after_commit):
+            code, _ = self.invoke()
+        self.assertEqual(code, 130)
+        self.assertEqual(self.rows("SELECT state FROM transfers")[0][0], "ready")
+        self.assertEqual(len(list(self.cfg.work.iterdir())), 1)
+        del self.remote.entries["a.pdf"]
+        code, _ = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertEqual((self.cfg.export / "a.pdf").read_bytes(), b"only copy")
+        self.assertEqual(self.remote.opens, ["a.pdf"])
+
+    def test_failed_initialization_can_be_retried(self):
+        from clm_exporter import state
+
+        connect = sqlite3.connect
+
+        class BrokenSchema(sqlite3.Connection):
+            def executescript(self, script):
+                super().executescript("BEGIN IMMEDIATE; CREATE TABLE partial(id INTEGER);")
+                raise sqlite3.OperationalError("database or disk is full")
+
+        failures = [
+            Mock(side_effect=sqlite3.OperationalError("unable to open database file")),
+            lambda *args, **kwargs: connect(*args, **kwargs, factory=BrokenSchema),
+        ]
+        for index, failure in enumerate(failures):
+            with self.subTest(stage=index):
+                cfg = replace(self.cfg, working_directory=self.root / f"new-{index}")
+                with patch.object(state.sqlite3, "connect", failure), self.assertRaises(sqlite3.OperationalError):
+                    execute(cfg, "init", progress=False)
+                self.assertFalse(cfg.database.exists())
+                self.assertFalse(Path(str(cfg.database) + "-wal").exists())
+                self.assertFalse(Path(str(cfg.database) + "-shm").exists())
+                with redirect_stderr(io.StringIO()):
+                    self.assertEqual(execute(cfg, "init", progress=False)[0], 0)
+
+    def test_initialization_sync_failure_keeps_committed_database(self):
+        cfg = replace(self.cfg, working_directory=self.root / "committed")
+        with patch("clm_exporter.state.sync_directory", side_effect=OSError("sync failed")), self.assertRaises(OSError):
+            execute(cfg, "init", progress=False)
+        self.assertTrue(cfg.database.exists())
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(execute(cfg, "status", progress=False)[0], 0)
+
+    def test_initialization_interrupt_after_commit_keeps_database(self):
+        from clm_exporter import state
+
+        connect = sqlite3.connect
+
+        class InterruptedCommit(sqlite3.Connection):
+            def execute(self, sql, *args):
+                result = super().execute(sql, *args)
+                if sql == "COMMIT":
+                    raise KeyboardInterrupt
+                return result
+
+        cfg = replace(self.cfg, working_directory=self.root / "interrupted-commit")
+        with (
+            patch.object(state.sqlite3, "connect",
+                         lambda *args, **kwargs: connect(*args, **kwargs, factory=InterruptedCommit)),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            execute(cfg, "init", progress=False)
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(execute(cfg, "status", progress=False)[0], 0)
 
     def test_lost_ready_copies_return_pending(self):
         self.remote.add("a.pdf", b"pdf")

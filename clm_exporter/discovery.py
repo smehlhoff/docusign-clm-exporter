@@ -71,7 +71,10 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
                     attribute_error = None
                     attribute_operation = "metadata"
                     is_pdf = name.casefold().endswith(".pdf")
-                    if (entry_kind(attrs) in ("special", "unknown")
+                    # PDF selection does not depend on an ambiguous type label.
+                    # Reuse listing metadata instead of paying one round trip
+                    # per PDF; transfers recheck it before and after reading.
+                    if ((not is_pdf and entry_kind(attrs) in ("special", "unknown"))
                             or any(getattr(attrs, n, None) is None for n in ("st_size", "st_mtime"))):
                         try:
                             attrs = remote.lstat(relative)
@@ -83,7 +86,7 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
                                             ensure_ascii=True)
                     kind = entry_kind(attrs)
                     verified_non_directory = kind in ("file", "symlink")
-                    if kind in ("special", "unknown"):
+                    if not is_pdf and kind in ("special", "unknown"):
                         # Do not silently exclude a subtree based on CLM's mode.
                         # Leave failed checks unknown so old children cannot be
                         # mistaken for deletions through this uninspected entry.
@@ -94,20 +97,11 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
                                 kind = "directory"
                             except (OSError, EOFError, MetadataError) as exc:
                                 remote.reconnect(exc)
-                                # SFTP v3 uses NO_SUCH_FILE or generic FAILURE
-                                # when OPENDIR targets a file. Keep ambiguous
-                                # PDFs eligible after these rejections, but do
-                                # not hide permission or connection failures.
-                                rejected_pdf = is_pdf and (
-                                    isinstance(exc, (FileNotFoundError, NotADirectoryError))
-                                    or type(exc) is OSError and exc.errno is None
-                                )
-                                if not rejected_pdf:
-                                    attribute_error = exc
+                                attribute_error = exc
                         if attribute_error is not None:
                             attribute_operation = "directory"
                             LOG.warning("Cannot verify possible directory %r: %s", relative, attribute_error)
-                    selected = is_pdf and kind != "directory" and attribute_operation != "directory"
+                    selected = is_pdf and kind != "directory"
                     if selected:
                         # CLM can label downloadable PDFs as special or unknown.
                         # Preserve the reported mode in attributes for diagnostics.

@@ -82,9 +82,10 @@ class State:
                 raise FatalError("State already exists; init will not replace it") from exc
         elif not cfg.database.is_file():
             raise FatalError("State database is missing; use init only for a new export")
-        self.db = sqlite3.connect(cfg.database.as_uri() + "?mode=rw", uri=True, isolation_level=None)
-        self.db.row_factory = sqlite3.Row
+        self.db = None
         try:
+            self.db = sqlite3.connect(cfg.database.as_uri() + "?mode=rw", uri=True, isolation_level=None)
+            self.db.row_factory = sqlite3.Row
             self.db.execute("PRAGMA foreign_keys=ON")
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("PRAGMA synchronous=FULL")
@@ -101,7 +102,21 @@ class State:
             if source is None or json.loads(source["identity"]) != cfg.identity or source["destination"] != str(cfg.export):
                 raise FatalError("Database is bound to a different source or destination")
         except BaseException:
-            self.db.close()
+            remove_created = created and self.db is None
+            if self.db is not None:
+                try:
+                    self.db.rollback()
+                    if created:
+                        # Inspect after rollback: even an interrupt immediately
+                        # after COMMIT must retain the initialized database.
+                        remove_created = self.db.execute("PRAGMA user_version").fetchone()[0] == 0
+                except sqlite3.Error:
+                    # Preserve state when its committed status cannot be read.
+                    pass
+                finally:
+                    self.db.close()
+            if remove_created:
+                cfg.database.unlink(missing_ok=True)
             raise
 
     def close(self):
