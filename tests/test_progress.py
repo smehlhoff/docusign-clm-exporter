@@ -81,20 +81,28 @@ class ProgressTests(unittest.TestCase):
             code = main(["download", "--config", "unused.toml", *options])
         return code, json.loads(stdout.getvalue())
 
-    def test_scan_has_unknown_total_and_transfer_counts_written_bytes(self):
+    def test_scan_and_transfer_counts_include_empty_and_failed_files(self):
         self.remote.add("dir/a.pdf", b"12345")
         self.remote.add("dir/not.txt")
-        code, _ = self.invoke()
-        self.assertEqual(code, 0)
+        self.remote.add("empty.pdf", b"")
+        self.remote.add("failed.pdf")
+
+        def deny_open(path):
+            if path == "failed.pdf":
+                raise PermissionError("denied")
+
+        self.remote.open_hook = deny_open
+        code, summary = self.invoke()
+        self.assertEqual(code, 2)
+        self.assertEqual(summary["new_successes"], 2)
         scan = self.bars("entry")[0]
         self.assertIsNone(scan.options["total"])
-        self.assertEqual(scan.n, 3)
+        self.assertEqual(scan.n, 5)
         self.assertNotIn("remaining", scan.options["bar_format"])
         files = self.bars("file")[0]
-        self.assertEqual((files.n, files.options["total"]), (1, 1))
-        byte_bar = self.bars("B")[0]
-        self.assertEqual((byte_bar.n, byte_bar.options["total"]), (5, 5))
-        self.assertEqual(byte_bar.options["unit_divisor"], 1000)
+        self.assertEqual((files.n, files.options["total"]), (3, 3))
+        self.assertEqual([(bar.n, bar.options["total"]) for bar in self.bars("B")], [(5, 5), (0, 0), (0, 3)])
+        self.assertEqual(self.bars("B")[0].options["unit_divisor"], 1000)
         self.assertTrue(all(bar.closed for bar in self.display.bars))
 
     def test_empty_directories_report_rate_limited_progress_with_or_without_bars(self):
@@ -188,18 +196,6 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(self.bars("file")[0].n, 0)
         self.assertTrue(all(bar.closed for bar in self.display.bars))
         self.assertFalse(list(self.cfg.work.iterdir()))
-
-    def test_zero_byte_pdf_and_failure_count_processed_not_successes(self):
-        self.remote.add("a.pdf", b"")
-        self.remote.add("b.pdf")
-        self.remote.open_hook = lambda path: (_ for _ in ()).throw(PermissionError("denied")) if path == "b.pdf" else None
-        code, summary = self.invoke()
-        self.assertEqual(code, 2)
-        self.assertEqual(summary["new_successes"], 1)
-        self.assertEqual(self.bars("file")[0].n, 2)
-        self.assertEqual(self.bars("B")[0].options["total"], 0)
-        self.assertEqual(self.bars("B")[0].n, 0)
-        self.assertTrue(all(bar.closed for bar in self.display.bars))
 
     def test_cli_nonterminal_and_opt_out_do_not_require_tqdm(self):
         for name, stream, options in (

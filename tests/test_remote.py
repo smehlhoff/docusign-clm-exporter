@@ -88,23 +88,6 @@ class AdapterTests(unittest.TestCase):
             self.remote()
         self.client.connect.assert_not_called()
 
-    def test_security_rejections_are_fatal_without_retry(self):
-        def unknown_host(**kwargs):
-            policy = self.client.set_missing_host_key_policy.call_args.args[0]
-            policy.missing_host_key(self.client, "unknown.example", Mock())
-
-        for failure, message in (
-            (unknown_host, "Untrusted SSH host key"),
-            (BadHostKeyException("mismatch"), "host-key verification failed"),
-            (AuthenticationException("rejected"), "authentication.*failed"),
-        ):
-            with self.subTest(failure=message):
-                self.client.connect.reset_mock()
-                self.client.connect.side_effect = failure
-                with self.assertRaisesRegex(FatalError, message):
-                    self.remote().connect()
-                self.assertEqual(self.client.connect.call_count, 1)
-
     def test_connection_and_reconnection_budgets_are_bounded(self):
         self.client.connect.side_effect = ConnectionError("down")
         with self.assertRaisesRegex(FatalError, "after 3 attempts"):

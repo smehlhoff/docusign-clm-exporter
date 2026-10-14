@@ -97,7 +97,7 @@ class ProtocolTests(unittest.TestCase):
                     return handle
 
             cfg = Config("sftp.test", "operator", key_path, known, "/", root / "working", min_free_bytes=0,
-                         max_attempts=1, read_timeout_seconds=1 if stall else 60)
+                         max_attempts=1 if stall else 3, read_timeout_seconds=1 if stall else 60)
             with redirect_stderr(io.StringIO()):
                 execute(cfg, "init")
             client_socket, server_socket = socket.socketpair()
@@ -114,8 +114,11 @@ class ProtocolTests(unittest.TestCase):
             thread = threading.Thread(target=serve, daemon=True)
             thread.start()
             original_connect = p.SSHClient.connect
+            connections = 0
 
             def connect(client, **kwargs):
+                nonlocal connections
+                connections += 1
                 return original_connect(client, sock=client_socket, **kwargs)
             # Bound the regression itself when exercising the unfixed implementation.
             watchdog = threading.Timer(4 if stall else 30, client_socket.close)
@@ -126,9 +129,9 @@ class ProtocolTests(unittest.TestCase):
                 with (
                     patch.object(p.SSHClient, "connect", connect),
                     patch("getpass.getpass", return_value=password) as prompt,
-                    redirect_stderr(io.StringIO()),
+                    redirect_stderr(io.StringIO()) as stderr,
                 ):
-                    code, summary = execute(cfg, "download")
+                    code, summary = execute(cfg, "download", sleep=lambda _: None)
                 if password:
                     prompt.assert_called_once()
                 else:
@@ -154,7 +157,11 @@ class ProtocolTests(unittest.TestCase):
                         self.assertEqual(summary["directories_discovered"], 6)
                 else:
                     self.assertEqual(code, 1)
+                    self.assertEqual(summary["stop_reason"], "fatal_error")
                     self.assertEqual(summary["historical_successful_transfers"], 0)
+                    self.assertEqual(connections, 1)
+                    message = "Untrusted SSH host key" if trust == "unknown" else "SSH authentication or host-key verification failed"
+                    self.assertIn(message, stderr.getvalue())
             finally:
                 watchdog.cancel()
                 watchdog.join()
@@ -164,31 +171,25 @@ class ProtocolTests(unittest.TestCase):
                 server_socket.close()
                 thread.join(timeout=5)
 
-    def test_trusted_rsa_transfer(self):
-        self.exercise()
-
-    def test_encrypted_rsa_transfer(self):
-        self.exercise(password="test-only-passphrase")
+    def test_rsa_transfer_with_plain_and_encrypted_keys(self):
+        for password in (None, "test-only-passphrase"):
+            with self.subTest(encrypted=password is not None):
+                self.exercise(password=password)
 
     def test_nested_transfer_with_clm_special_types(self):
         for directory_mode in (0o140750, 0o750):
             with self.subTest(directory_mode=oct(directory_mode)):
                 self.exercise(reported_mode=0o140640, directory_mode=directory_mode)
 
-    def test_unknown_host_rejected(self):
-        self.exercise(trust="unknown")
+    def test_security_rejections_are_fatal_without_retry(self):
+        for trust, accepted in (("unknown", True), ("mismatch", True), ("trusted", False)):
+            with self.subTest(trust=trust, accepted=accepted):
+                self.exercise(trust=trust, accepted=accepted)
 
-    def test_mismatched_host_rejected(self):
-        self.exercise(trust="mismatch")
-
-    def test_invalid_credentials_rejected(self):
-        self.exercise(accepted=False)
-
-    def test_stalled_sftp_version_negotiation_obeys_timeout(self):
-        self.exercise(stall="version")
-
-    def test_stalled_sftp_subsystem_request_obeys_timeout(self):
-        self.exercise(stall="request")
+    def test_stalled_sftp_setup_obeys_timeout(self):
+        for stage in ("version", "request"):
+            with self.subTest(stage=stage):
+                self.exercise(stall=stage)
 
     def test_invalid_utf8_filename_retains_partial_scan_and_reports_error(self):
         self.exercise(invalid_name=True)

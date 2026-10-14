@@ -374,48 +374,24 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(summary["local_download_complete"])
 
-    def test_invalid_remote_file_type_does_not_block_pdf_downloads(self):
-        self.remote.add("a.pdf")
-        self.remote.add("z.pdf")
-        original = self.remote.lstat
-
-        def malformed(path):
-            info = original(path)
-            if path == "a.pdf":
-                info.st_mode = "invalid"
-            return info
-
-        self.remote.lstat = malformed
-        code, summary = self.invoke()
+    def test_unusable_file_types_do_not_block_pdf_inventory_or_download(self):
+        pdfs = ["invalid.pdf", "permissions.PDF", "regular.pdf"]
+        for path in pdfs:
+            self.remote.add(path)
+        self.remote.reported_modes.update({"invalid.pdf": "invalid", "permissions.PDF": 0o600})
+        code, summary = self.invoke("inventory")
         self.assertEqual(code, 0)
-        self.assertEqual(self.remote.opens, ["a.pdf", "z.pdf"])
-        self.assertTrue(summary["local_download_complete"])
+        self.assertEqual(summary["pdfs_discovered"], len(pdfs))
+        self.assertFalse(self.remote.opens)
 
-    def test_permissions_without_file_type_still_select_pdf(self):
-        self.remote.add("a.pdf")
-        original_list = self.remote.iterdir
-        original_stat = self.remote.lstat
-
-        def missing_type(directory):
-            for info in original_list(directory):
-                info.st_mode = 0o600
-                yield info
-
-        self.remote.iterdir = missing_type
-        self.assertEqual(self.invoke("inventory")[1]["pdfs_discovered"], 1)
-
-        def stat_missing_type(path):
-            info = original_stat(path)
-            if path == "a.pdf":
-                info.st_mode = 0o600
-            return info
-
-        self.remote.lstat = stat_missing_type
         code, summary = self.invoke()
         self.assertEqual(code, 0)
         self.assertTrue(summary["scan_complete"])
         self.assertTrue(summary["local_download_complete"])
-        self.assertEqual(self.remote.opens, ["a.pdf"])
+        self.assertEqual(self.remote.opens, pdfs)
+        for path in pdfs:
+            with self.subTest(path=path):
+                self.assertEqual((self.cfg.export / path).read_bytes(), b"pdf")
 
     def test_unavailable_before_success_is_not_hidden(self):
         self.remote.add("dir/a.pdf")
@@ -650,9 +626,13 @@ class ExportTests(unittest.TestCase):
         self.remote.add("a.pdf")
         self.assertEqual(self.invoke("inventory")[0], 0)
         self.assertFalse(self.remote.opens)
-        self.assertEqual(self.invoke("reconcile")[0], 2)
+        code, original = self.invoke("reconcile")
+        self.assertEqual(code, 2)
         self.assertEqual(len(self.rows("SELECT * FROM transfers")), 1)
-        self.invoke()
+        code, rebuilt = self.invoke("status", report_run=original["run_id"])
+        self.assertEqual(code, 2)
+        self.assertEqual(rebuilt["pending_deferred_count"], 1)
+        self.assertEqual(self.invoke()[0], 0)
         (self.cfg.export / "a.pdf").unlink()
         code, summary = self.invoke("reconcile")
         self.assertEqual(code, 0)
@@ -731,14 +711,6 @@ class ExportTests(unittest.TestCase):
                 code, rebuilt = self.invoke("status", report_run=failed["run_id"])
                 self.assertEqual(code, expected)
                 self.assertEqual(rebuilt["stop_reason"], failed["stop_reason"])
-
-    def test_reconstructed_reconciliation_still_reports_gaps(self):
-        self.remote.add("a.pdf")
-        code, original = self.invoke("reconcile")
-        self.assertEqual(code, 2)
-        code, rebuilt = self.invoke("status", report_run=original["run_id"])
-        self.assertEqual(code, 2)
-        self.assertEqual(rebuilt["pending_deferred_count"], 1)
 
     def test_reconstructed_report_failure_still_backs_up_state(self):
         _, original = self.invoke("inventory")
