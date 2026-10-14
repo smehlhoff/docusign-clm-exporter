@@ -147,13 +147,13 @@ class ProtocolTests(unittest.TestCase):
                     self.assertEqual(summary["historical_successful_transfers"], 0)
                 elif invalid_name:
                     self.assertEqual(code, 2)
-                    self.assertFalse(summary["scan_complete"])
+                    self.assertEqual(summary["scan_status"], "incomplete")
                     self.assertEqual(summary["unresolved_directory_errors"], 1)
                     self.assertEqual(summary["new_successes"], 1)
                     self.assertTrue(Path(summary["reports"]["backup"]).exists())
                 elif trust == "trusted" and accepted:
                     self.assertEqual(code, 0)
-                    self.assertTrue(summary["scan_complete"])
+                    self.assertEqual(summary["scan_status"], "complete")
                     self.assertEqual(summary["new_successes"], len(pdfs))
                     for relative in pdfs:
                         self.assertEqual((cfg.export / relative).read_bytes(), (source / relative).read_bytes())

@@ -125,7 +125,7 @@ class ProgressTests(unittest.TestCase):
                     code, summary = self.invoke("inventory", progress=enabled)
 
                 self.assertEqual(code, 0)
-                self.assertTrue(summary["scan_complete"])
+                self.assertEqual(summary["scan_status"], "complete")
                 self.assertFalse(self.remote.opens)
                 self.assertEqual(summary["directories_discovered"], 6)
                 saved = json.loads(Path(summary["reports"]["summary"]).read_text())

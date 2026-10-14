@@ -71,7 +71,7 @@ class ExportTests(unittest.TestCase):
         self.remote.iterdir = malformed
         code, summary = self.invoke()
         self.assertEqual(code, 2)
-        self.assertFalse(summary["scan_complete"])
+        self.assertEqual(summary["scan_status"], "incomplete")
         self.assertEqual(self.remote.opens, ["healthy.pdf"])
         errors = self.csv(summary, "unresolved")
         self.assertEqual(
@@ -95,7 +95,7 @@ class ExportTests(unittest.TestCase):
         self.remote.iterdir = malformed
         code, summary = self.invoke()
         self.assertEqual(code, 2)
-        self.assertFalse(summary["scan_complete"])
+        self.assertEqual(summary["scan_status"], "incomplete")
         self.assertEqual(self.remote.opens, ["healthy.pdf"])
         errors = self.csv(summary, "unresolved")
         self.assertEqual(errors[0]["category"], "unsafe_remote_path")
@@ -119,7 +119,15 @@ class ExportTests(unittest.TestCase):
         self.assertEqual((self.cfg.export / "x.pdf/nested/C.pDf").read_bytes(), b"pdf")
         self.assertFalse((self.cfg.export / "not.txt").exists())
         self.assertTrue(summary["local_download_complete"])
-        self.assertEqual(summary["cloud_delivery"], "not_assessed")
+        self.assertNotIn("cloud_delivery", summary)
+        self.assertNotIn("scan_complete", summary)
+        self.assertNotIn("remote_root", summary)
+        self.assertEqual(summary["scan_status"], "complete")
+        self.assertEqual(summary["source"], {
+            "host": "sftp.test", "port": 22, "username": "operator", "remote_root": "/root",
+        })
+        saved = json.loads(Path(summary["reports"]["summary"]).read_text())
+        self.assertEqual(saved, summary)
 
     def test_cleanup_keeps_history_and_new_files_are_found(self):
         self.remote.add("old/A.pdf")
@@ -365,7 +373,7 @@ class ExportTests(unittest.TestCase):
         self.remote.missing_attrs.add("missing.pdf")
         code, summary = self.invoke()
         self.assertEqual(code, 2)
-        self.assertFalse(summary["scan_complete"])
+        self.assertEqual(summary["scan_status"], "incomplete")
         self.assertEqual(self.remote.opens, ["ok/a.pdf"])
         self.assertEqual(summary["pdfs_with_unknown_size"], 1)
         self.remote.denied.clear()
@@ -386,7 +394,7 @@ class ExportTests(unittest.TestCase):
 
         code, summary = self.invoke()
         self.assertEqual(code, 0)
-        self.assertTrue(summary["scan_complete"])
+        self.assertEqual(summary["scan_status"], "complete")
         self.assertTrue(summary["local_download_complete"])
         self.assertEqual(self.remote.opens, pdfs)
         for path in pdfs:
@@ -426,7 +434,7 @@ class ExportTests(unittest.TestCase):
         with patch.object(self.remote, "lstat", wraps=self.remote.lstat) as lstat:
             code, summary = self.invoke("inventory")
         self.assertEqual(code, 0)
-        self.assertTrue(summary["scan_complete"])
+        self.assertEqual(summary["scan_status"], "complete")
         self.assertEqual(summary["pdfs_discovered"], 2)
         self.assertEqual([c.args[0] for c in lstat.call_args_list], ["", "mtime.pdf", "size.pdf"])
 
@@ -446,7 +454,7 @@ class ExportTests(unittest.TestCase):
                 with patch.object(self.remote, "check_directory", wraps=self.remote.check_directory) as probe:
                     code, summary = self.invoke(command)
                 self.assertEqual(code, 0)
-                self.assertTrue(summary["scan_complete"])
+                self.assertEqual(summary["scan_status"], "complete")
                 self.assertEqual(summary["directories_discovered"], 6)
                 self.assertEqual(summary["pdfs_discovered"], len(pdfs))
                 self.assertEqual([c.args[0] for c in probe.call_args_list], ["missing", "permissions", "special"])
@@ -467,7 +475,7 @@ class ExportTests(unittest.TestCase):
                 with patch.object(self.remote, "check_directory", side_effect=failure):
                     code, summary = self.invoke("download")
                 self.assertEqual(code, 2)
-                self.assertFalse(summary["scan_complete"])
+                self.assertEqual(summary["scan_status"], "incomplete")
                 self.assertEqual(summary["unresolved_directory_errors"], 1)
                 self.assertFalse(self.remote.opens)
                 code, summary = self.invoke()
@@ -526,7 +534,7 @@ class ExportTests(unittest.TestCase):
                     with patch.object(self.remote, "check_directory", side_effect=failure):
                         code, summary = self.invoke("inventory")
                     self.assertEqual(code, 2)
-                    self.assertFalse(summary["scan_complete"])
+                    self.assertEqual(summary["scan_status"], "incomplete")
                     self.assertEqual(summary["pdfs_discovered"], 1)
                     self.assertIn("Cannot verify possible directory 'dir'", Path(summary["reports"]["log"]).read_text())
                     errors = self.csv(summary, "unresolved")
@@ -556,7 +564,7 @@ class ExportTests(unittest.TestCase):
         with patch.object(self.remote, "check_directory", side_effect=AssertionError("stat established the type")):
             code, summary = self.invoke()
         self.assertEqual(code, 0)
-        self.assertTrue(summary["scan_complete"])
+        self.assertEqual(summary["scan_status"], "complete")
         self.assertEqual(self.remote.opens, ["System Admin/Templates/test.pdf"])
         self.assertEqual(summary["directories_discovered"], 2)
         self.assertEqual((self.cfg.export / "System Admin/Templates/test.pdf").read_bytes(), b"pdf")
@@ -576,7 +584,7 @@ class ExportTests(unittest.TestCase):
             self.remote.add(path, kind="file")
         code, summary = self.invoke("reconcile")
         self.assertEqual(code, 2)
-        self.assertTrue(summary["scan_complete"])
+        self.assertEqual(summary["scan_status"], "complete")
         self.assertEqual(summary["unresolved_directory_errors"], 0)
         self.assertEqual([(e["remote_path"], e["operation"]) for e in self.csv(summary, "unresolved")],
                          [("pending/unfinished.pdf", "availability")])
@@ -623,7 +631,7 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(self.remote.opens, ["a.pdf", "b.pdf", "a.pdf"])
         staged = {row["remote_path"]: row for row in self.csv(summary, "staging")}
         self.assertEqual(staged["a.pdf"]["forced"], "1")
-        self.assertEqual(staged["a.pdf"]["payload_status"], "staged")
+        self.assertNotIn("payload_status", staged["a.pdf"])
         self.assertEqual(staged["b.pdf"]["forced"], "0")
         self.cfg = replace(self.cfg, max_staged_bytes=6)
         self.assertEqual(self.invoke(force_path="b.pdf")[1]["stop_reason"], "batch_capacity")
@@ -664,7 +672,7 @@ class ExportTests(unittest.TestCase):
         self.remote.iterdir = lambda _: iter([attrs("../escape.pdf"), attrs("/absolute.pdf")])
         code, summary = self.invoke()
         self.assertEqual(code, 2)
-        self.assertFalse(summary["scan_complete"])
+        self.assertEqual(summary["scan_status"], "incomplete")
         self.assertFalse(self.remote.opens)
 
     def test_local_symlinks_and_unrepresentable_names(self):
@@ -1124,7 +1132,7 @@ class ExportTests(unittest.TestCase):
 
         self.assertEqual(code, 2)
         self.assertEqual(attempts, [""])
-        self.assertFalse(summary["scan_complete"])
+        self.assertEqual(summary["scan_status"], "incomplete")
         self.assertEqual(summary["pdfs_discovered"], 1)
         self.assertEqual(summary["unresolved_directory_errors"], 1)
         self.assertEqual(self.remote.opens, ["a.pdf"])
@@ -1143,7 +1151,7 @@ class ExportTests(unittest.TestCase):
         code, summary = self.invoke("inventory")
 
         self.assertEqual(code, 2)
-        self.assertFalse(summary["scan_complete"])
+        self.assertEqual(summary["scan_status"], "incomplete")
         self.assertEqual(summary["pdfs_discovered"], 1)
         errors = self.csv(summary, "unresolved")
         self.assertEqual(
@@ -1153,7 +1161,7 @@ class ExportTests(unittest.TestCase):
 
         code, summary = self.invoke("inventory")
         self.assertEqual(code, 0)
-        self.assertTrue(summary["scan_complete"])
+        self.assertEqual(summary["scan_status"], "complete")
         self.assertEqual(self.csv(summary, "unresolved"), [])
 
     def test_disk_full_during_flush_discards_payload_and_preserves_staging(self):

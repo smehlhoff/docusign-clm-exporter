@@ -88,12 +88,12 @@ def write_reports(state, run, scan_run=None, backup_run=None):
         present.add(path_id)
         staged.append({"remote_path": path["remote"], "mapped_path": path["local"], "size": success["size"],
                        "mtime": success["mtime"], "sha256": success["sha256"], "completed_at": success["completed_at"],
-                       "completion_run": success["completion_run"], "transfer_id": success["id"], "zero_byte": success["size"] == 0,
-                       "forced": success["forced"], "payload_status": "staged"})
+                       "completion_run": success["completion_run"], "transfer_id": success["id"],
+                       "forced": success["forced"]})
         if time.monotonic() - progress_at >= 5:
             logging.getLogger("clm_exporter").info("Staging manifest: verified %d present PDFs", len(staged))
             progress_at = time.monotonic()
-    transfer_fields = ["remote_path", "mapped_path", "size", "mtime", "sha256", "completed_at", "completion_run", "transfer_id", "forced", "zero_byte", "payload_status"]
+    transfer_fields = ["remote_path", "mapped_path", "size", "mtime", "sha256", "completed_at", "completion_run", "transfer_id", "forced"]
     write_csv("staging", transfer_fields, staged)
 
     def history_rows(only_run=False):
@@ -103,16 +103,15 @@ def write_reports(state, run, scan_run=None, backup_run=None):
             path = paths[transfer["path_id"]]
             is_latest = latest[path["id"]]["id"] == transfer["id"]
             yield dict(transfer, remote_path=path["remote"], mapped_path=path["local"], transfer_id=transfer["id"],
-                       zero_byte=transfer["size"] == 0,
                        payload_status="superseded" if not is_latest else "staged" if path["id"] in present else "absent_or_unverified")
-    write_csv("downloads", transfer_fields, history_rows(True))
-    write_csv("history", transfer_fields, history_rows())
-    write_csv("path_map", ["remote_path", "mapped_path", "kind", "last_seen_run", "collision_key"],
+    write_csv("downloads", [field for field in transfer_fields if field != "completion_run"] + ["payload_status"], history_rows(True))
+    write_csv("history", transfer_fields + ["payload_status"], history_rows())
+    write_csv("path_map", ["remote_path", "mapped_path", "kind", "last_seen_run"],
              (dict(p, remote_path=p["remote"], mapped_path=p["local"]) for p in paths.values()))
     errors = [dict(e, remote_path=e["remote"], mapped_path=e["local"], attempt_count=e["attempts"])
               for e in db.execute("SELECT e.*,p.local FROM errors e LEFT JOIN paths p ON p.remote=e.remote ORDER BY e.id")]
-    error_fields = ["run_id", "timestamp", "remote_path", "mapped_path", "operation", "category", "attempt_count", "message", "resolved_at", "resolved_run"]
-    write_csv("failures", error_fields, (e for e in errors if e["run_id"] == run))
+    error_fields = ["run_id", "timestamp", "remote_path", "mapped_path", "operation", "category", "attempt_count", "message"]
+    write_csv("failures", error_fields + ["resolved_at", "resolved_run"], (e for e in errors if e["run_id"] == run))
     unresolved = [e for e in errors if e["resolved_at"] is None]
     write_csv("unresolved", error_fields, unresolved)
     observations = db.execute("SELECT * FROM observations WHERE run_id=? AND selected=1", (scan_run,)).fetchall() if scan_run else []
@@ -146,12 +145,13 @@ def write_reports(state, run, scan_run=None, backup_run=None):
     changed = sum(db.execute("SELECT EXISTS(SELECT 1 FROM transfers WHERE path_id=? AND state='downloaded' AND id<?)",
                              (t["path_id"], t["id"])).fetchone()[0] for t in completed)
     source = db.execute("SELECT * FROM source WHERE id=1").fetchone()
+    source_identity = dict(zip(("host", "port", "username", "remote_root"), json.loads(source["identity"]), strict=True))
     scan_complete = bool(scan and scan["scan_status"] == "complete")
     summary = {
         "run_id": run, "command": record["command"], "started_at": record["started_at"], "ended_at": record["ended_at"],
-        "generated_at": utcnow(), "stop_reason": record["stop_reason"], "source": json.loads(source["identity"]),
-        "remote_root": cfg.remote_root, "destination": str(cfg.export), "host_key_fingerprint": source["host_key_fingerprint"],
-        "scan_run": scan_run, "scan_status": scan["scan_status"] if scan else "not_started", "scan_complete": scan_complete,
+        "generated_at": utcnow(), "stop_reason": record["stop_reason"], "source": source_identity,
+        "destination": str(cfg.export), "host_key_fingerprint": source["host_key_fingerprint"],
+        "scan_run": scan_run, "scan_status": scan["scan_status"] if scan else "not_started",
         "scan_started_at": scan["scan_started_at"] if scan else None, "scan_ended_at": scan["scan_ended_at"] if scan else None,
         "directories_discovered": directories_discovered,
         "pdfs_discovered": len(observations), "bytes_discovered": sum(p["size"] or 0 for p in observations),
@@ -167,7 +167,7 @@ def write_reports(state, run, scan_run=None, backup_run=None):
         "historically_downloaded_absent_or_unverified": len(latest) - len(staged),
         "current_staged_bytes": staged_bytes, "current_free_bytes": shutil.disk_usage(cfg.export).free,
         "local_download_complete": scan_complete and not gaps and not unresolved and record["stop_reason"] not in ("fatal_error", "interrupted"),
-        "cloud_delivery": "not_assessed", "reports": locations,
+        "reports": locations,
     }
     # Persist summary before file output so a report-write interruption is reconstructable.
     with state.transaction():
