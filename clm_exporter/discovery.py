@@ -194,6 +194,29 @@ def _record_unavailable_paths(state: State, run: str) -> None:
     db = state.db
     # Infer absence only through a fully enumerated ancestor. A failed subtree is unknown.
     scan_states = dict(db.execute("SELECT remote,state FROM scans WHERE run_id=?", (run,)))
+
+    def absence_proven(path):
+        parent = path["parent"]
+        while parent not in scan_states and parent:
+            ancestor = db.execute("SELECT kind,last_seen_run FROM paths WHERE remote=?", (parent,)).fetchone()
+            if ancestor and ancestor["last_seen_run"] == run and ancestor["kind"] in ("directory", "unknown"):
+                # A visible ancestor whose tree could not be inspected is not
+                # evidence that its previously observed children disappeared.
+                return False
+            parent = parent.rpartition("/")[0]
+        return scan_states.get(parent) == "complete"
+
+    # A removed directory no longer needs scanning. Retire its old scan errors
+    # only when the current enumeration proves absence; unfinished PDFs below
+    # it are still reported independently as unavailable.
+    missing_directories = db.execute("""SELECT p.* FROM paths p WHERE p.last_seen_run<>?
+        AND EXISTS(SELECT 1 FROM errors e WHERE e.remote=p.remote
+                   AND e.operation='directory' AND e.resolved_at IS NULL)""", (run,)).fetchall()
+    with state.transaction():
+        for path in missing_directories:
+            if absence_proven(path):
+                state.resolve(run, path["remote"], ["directory"])
+
     # The current selected flag can disappear when a PDF changes type. Retain
     # unfinished work even when an older version was successfully downloaded.
     missing = db.execute("""SELECT p.* FROM paths p
@@ -203,15 +226,7 @@ def _record_unavailable_paths(state: State, run: str) -> None:
              OR EXISTS(SELECT 1 FROM transfers t WHERE t.path_id=p.id
                        AND t.state IN ('pending','failed','downloading','ready')))""", (run,)).fetchall()
     for path in missing:
-        parent = path["parent"]
-        while parent not in scan_states and parent:
-            ancestor = db.execute("SELECT kind,last_seen_run FROM paths WHERE remote=?", (parent,)).fetchone()
-            if ancestor and ancestor["last_seen_run"] == run and ancestor["kind"] in ("directory", "unknown"):
-                # A visible ancestor whose tree could not be inspected is not
-                # evidence that its previously observed children disappeared.
-                break
-            parent = parent.rpartition("/")[0]
-        if scan_states.get(parent) == "complete":
+        if absence_proven(path):
             state.error(run, path["remote"], "availability", "source_unavailable",
                         "Previously discovered PDF is unavailable with unfinished download work")
 

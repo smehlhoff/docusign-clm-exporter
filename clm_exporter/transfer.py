@@ -281,6 +281,10 @@ class Transfers:
             self.db.execute("UPDATE transfers SET state='ready',received=?,sha256=? WHERE id=?", (received, digest.hexdigest(), job["id"]))
 
     def discard(self, job: Row, state: str, error: str | None = None) -> None:
+        # Metadata refresh can commit a replacement job just before an
+        # interrupt. Do not revive the old job and collide with its successor.
+        if job["state"] == "superseded":
+            return
         # Recount after partial writes: the OS may have written fewer bytes than requested.
         self.remove_temp(job)
         self.capacity.staged = footprint(self.cfg)

@@ -129,7 +129,10 @@ class State:
             yield
             self.db.execute("COMMIT")
         except BaseException:
-            self.db.execute("ROLLBACK")
+            # COMMIT may have finished before an interrupt is delivered, and
+            # SQLite can roll back automatically after a statement fails.
+            # rollback() is also safe when no transaction remains active.
+            self.db.rollback()
             raise
 
     def run(self, command):

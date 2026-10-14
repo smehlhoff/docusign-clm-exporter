@@ -595,6 +595,35 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(summary["local_download_complete"])
 
+    def test_removed_directory_retires_scan_error_but_preserves_download_gap(self):
+        self.remote.add("gone/sub/pending.pdf")
+        self.assertEqual(self.invoke("inventory")[0], 0)
+        self.remote.denied.add("gone/sub")
+        self.assertEqual(self.invoke("inventory")[0], 2)
+        for name in ("gone/sub/pending.pdf", "gone/sub", "gone"):
+            del self.remote.entries[name]
+        code, summary = self.invoke("reconcile")
+        self.assertEqual(code, 2)
+        self.assertEqual(summary["unresolved_directory_errors"], 0)
+        self.assertEqual([(e["remote_path"], e["operation"]) for e in self.csv(summary, "unresolved")],
+                         [("gone/sub/pending.pdf", "availability")])
+        self.assertEqual(summary["pending_deferred_count"], 1)
+
+    def test_missing_directory_error_requires_a_complete_ancestor_scan(self):
+        self.remote.add("parent/gone", kind="directory")
+        self.remote.denied.add("parent/gone")
+        self.assertEqual(self.invoke("inventory")[0], 2)
+        del self.remote.entries["parent/gone"]
+        self.remote.denied.add("parent")
+        code, summary = self.invoke("reconcile")
+        self.assertEqual(code, 2)
+        self.assertEqual(summary["unresolved_directory_errors"], 2)
+        self.remote.denied.clear()
+        code, summary = self.invoke("reconcile")
+        self.assertEqual(code, 0)
+        self.assertTrue(summary["local_download_complete"])
+        self.assertEqual(self.csv(summary, "unresolved"), [])
+
     def test_transient_retry_budget_and_next_invocation(self):
         self.remote.add("a.pdf")
         self.remote.open_hook = lambda _: (_ for _ in ()).throw(ConnectionError("dropped"))
@@ -955,6 +984,69 @@ class ExportTests(unittest.TestCase):
             part.unlink()
         self.assertEqual(self.invoke()[0], 0)
         self.assertEqual(self.remote.opens, ["a.pdf", "a.pdf"])
+
+    def test_interrupt_after_ready_commit_is_not_masked_by_rollback(self):
+        from clm_exporter import state
+
+        connect = sqlite3.connect
+
+        class InterruptedCommit(sqlite3.Connection):
+            interrupt_commit = False
+
+            def execute(self, sql, *args):
+                result = super().execute(sql, *args)
+                if sql.startswith("UPDATE transfers SET state='ready'"):
+                    self.interrupt_commit = True
+                if sql == "COMMIT" and self.interrupt_commit:
+                    self.interrupt_commit = False
+                    raise KeyboardInterrupt
+                return result
+
+        self.remote.add("a.pdf")
+        with patch.object(state.sqlite3, "connect",
+                          lambda *args, **kwargs: connect(*args, **kwargs, factory=InterruptedCommit)):
+            code, summary = self.invoke()
+        self.assertEqual((code, summary["stop_reason"]), (130, "interrupted"))
+        self.assertEqual(self.rows("SELECT state FROM transfers")[0][0], "ready")
+        self.assertTrue(Path(summary["reports"]["backup"]).exists())
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual(self.remote.opens, ["a.pdf"])
+        self.assertEqual((self.cfg.export / "a.pdf").read_bytes(), b"pdf")
+
+    def test_interrupt_after_replacement_commit_keeps_successor_pending(self):
+        from clm_exporter import state
+
+        connect = sqlite3.connect
+
+        class InterruptedCommit(sqlite3.Connection):
+            interrupt_commit = False
+
+            def execute(self, sql, *args):
+                result = super().execute(sql, *args)
+                if sql.startswith("INSERT INTO transfers") and args[0][1] == 4:
+                    self.interrupt_commit = True
+                if sql == "COMMIT" and self.interrupt_commit:
+                    self.interrupt_commit = False
+                    raise KeyboardInterrupt
+                return result
+
+        self.remote.add("a.pdf")
+
+        def grow(relative):
+            if relative == "a.pdf":
+                self.remote.add(relative, b"long", 2)
+
+        self.remote.stat_hook = grow
+        with patch.object(state.sqlite3, "connect",
+                          lambda *args, **kwargs: connect(*args, **kwargs, factory=InterruptedCommit)):
+            code, summary = self.invoke()
+        self.assertEqual((code, summary["stop_reason"]), (130, "interrupted"))
+        self.assertEqual([r[0] for r in self.rows("SELECT state FROM transfers ORDER BY id")],
+                         ["superseded", "pending"])
+        self.assertTrue(Path(summary["reports"]["backup"]).exists())
+        self.assertFalse(self.remote.opens)
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual((self.cfg.export / "a.pdf").read_bytes(), b"long")
 
     def test_resolved_recovery_conflict_does_not_block_reverted_source(self):
         self.remote.add("a.pdf", b"old")

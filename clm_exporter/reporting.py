@@ -5,14 +5,17 @@ import os
 import shutil
 import time
 import uuid
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
+from sqlite3 import Row
+from typing import Any, TextIO
 
 from .errors import PathError, category
 from .local import digest_file, footprint, safe_target, sync_directory
-from .state import utcnow
+from .state import State, utcnow
 
 
-def atomic_write(path, writer):
+def atomic_write(path: Path, writer: Callable[[TextIO], None]) -> None:
     temp = path.with_name(f".{path.name}-{uuid.uuid4().hex}.tmp")
     try:
         with temp.open("x", encoding="utf-8", newline="") as stream:
@@ -27,15 +30,20 @@ def atomic_write(path, writer):
         temp.unlink(missing_ok=True)
 
 
-def csv_file(path, fields, rows):
-    def write(stream):
+def csv_file(
+    path: Path, fields: Sequence[str], rows: Iterable[Mapping[str, Any]]
+) -> None:
+    def write(stream: TextIO) -> None:
         writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
     atomic_write(path, write)
 
 
-def write_reports(state, run, scan_run=None, backup_run=None):
+def write_reports(
+    state: State, run: str, scan_run: str | None = None, backup_run: str | None = None
+) -> dict[str, Any]:
+    """Verify current staging and persist reports for a recorded run and scan."""
     db, cfg = state.db, state.cfg
     record = db.execute("SELECT * FROM runs WHERE id=?", (run,)).fetchone()
     if scan_run is None:
@@ -67,32 +75,7 @@ def write_reports(state, run, scan_run=None, backup_run=None):
     except (OSError, PathError) as exc:
         staged_bytes = None
         state.error(run, "", "local_layout", category(exc), exc)
-    staged, present = [], set()
-    progress_at = time.monotonic()
-    for path_id, success in latest.items():
-        path = paths[path_id]
-        try:
-            target = safe_target(cfg.export, path["local"])
-            actual = digest_file(target)
-            if actual != (success["size"], success["sha256"]):
-                raise PathError("Staged payload does not match its latest successful size and SHA-256")
-        except FileNotFoundError:
-            with state.transaction():
-                state.resolve(run, path["remote"], ["local"])
-            continue
-        except (OSError, PathError) as exc:
-            state.error(run, path["remote"], "local", category(exc), exc)
-            continue
-        with state.transaction():
-            state.resolve(run, path["remote"], ["local"])
-        present.add(path_id)
-        staged.append({"remote_path": path["remote"], "mapped_path": path["local"], "size": success["size"],
-                       "mtime": success["mtime"], "sha256": success["sha256"], "completed_at": success["completed_at"],
-                       "completion_run": success["completion_run"], "transfer_id": success["id"],
-                       "forced": success["forced"]})
-        if time.monotonic() - progress_at >= 5:
-            logging.getLogger("clm_exporter").info("Staging manifest: verified %d present PDFs", len(staged))
-            progress_at = time.monotonic()
+    staged, present = _verify_staging(state, run, latest, paths)
     transfer_fields = ["remote_path", "mapped_path", "size", "mtime", "sha256", "completed_at", "completion_run", "transfer_id", "forced"]
     write_csv("staging", transfer_fields, staged)
 
@@ -121,25 +104,7 @@ def write_reports(state, run, scan_run=None, backup_run=None):
         "SELECT COUNT(*) FROM observations WHERE run_id=? AND kind='directory'", (scan_run,)
     ).fetchone()[0]
     active = {t["path_id"]: t for t in db.execute("SELECT * FROM transfers WHERE state IN ('pending','failed','ready','downloading')")}
-    gaps, covered, unchanged = [], 0, 0
-    for p in observations:
-        success = latest.get(p["path_id"])
-        matches = success and (success["size"], success["mtime"]) == (p["size"], p["mtime"])
-        if matches:
-            covered += 1
-            unchanged += success["completion_run"] != run
-        if not matches or p["path_id"] in active:
-            path = paths[p["path_id"]]
-            gaps.append({"remote_path": path["remote"], "mapped_path": path["local"], "size": p["size"], "mtime": p["mtime"],
-                         "state": active[p["path_id"]]["state"] if p["path_id"] in active else "unresolved",
-                         "reason": "explicit_repeat_pending" if matches else "latest_success_does_not_match"})
-    observed_ids = {p["path_id"] for p in observations}
-    for path_id, transfer in active.items():
-        if path_id not in observed_ids:
-            path = paths[path_id]
-            gaps.append({"remote_path": path["remote"], "mapped_path": path["local"],
-                         "size": transfer["size"], "mtime": transfer["mtime"], "state": transfer["state"],
-                         "reason": "pending_path_not_observed"})
+    gaps, covered, unchanged = _download_gaps(observations, latest, paths, active, run)
     write_csv("gaps", ["remote_path", "mapped_path", "size", "mtime", "state", "reason"], gaps)
     completed = list(db.execute("SELECT * FROM transfers WHERE completion_run=? AND state='downloaded'", (run,)))
     changed = sum(db.execute("SELECT EXISTS(SELECT 1 FROM transfers WHERE path_id=? AND state='downloaded' AND id<?)",
@@ -175,3 +140,77 @@ def write_reports(state, run, scan_run=None, backup_run=None):
     if "summary" in locations:
         atomic_write(Path(locations["summary"]), lambda f: json.dump(summary, f, indent=2, ensure_ascii=True))
     return summary
+
+
+def _verify_staging(
+    state: State, run: str, latest: dict[int, Row], paths: dict[int, Row]
+) -> tuple[list[dict[str, Any]], set[int]]:
+    """Verify latest payloads, recording conflicts and resolving old local errors."""
+    cfg = state.cfg
+    staged, present = [], set()
+    progress_at = time.monotonic()
+    for path_id, success in latest.items():
+        path = paths[path_id]
+        try:
+            target = safe_target(cfg.export, path["local"])
+            actual = digest_file(target)
+            if actual != (success["size"], success["sha256"]):
+                raise PathError("Staged payload does not match its latest successful size and SHA-256")
+        except FileNotFoundError:
+            with state.transaction():
+                state.resolve(run, path["remote"], ["local"])
+            continue
+        except (OSError, PathError) as exc:
+            state.error(run, path["remote"], "local", category(exc), exc)
+            continue
+        with state.transaction():
+            state.resolve(run, path["remote"], ["local"])
+        present.add(path_id)
+        staged.append({"remote_path": path["remote"], "mapped_path": path["local"], "size": success["size"],
+                       "mtime": success["mtime"], "sha256": success["sha256"], "completed_at": success["completed_at"],
+                       "completion_run": success["completion_run"], "transfer_id": success["id"],
+                       "forced": success["forced"]})
+        if time.monotonic() - progress_at >= 5:
+            logging.getLogger("clm_exporter").info("Staging manifest: verified %d present PDFs", len(staged))
+            progress_at = time.monotonic()
+    return staged, present
+
+
+def _download_gaps(
+    observations: Sequence[Row],
+    latest: dict[int, Row],
+    paths: dict[int, Row],
+    active: dict[int, Row],
+    run: str,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Return gaps, covered versions, and unchanged skips in input order.
+
+    A matching successful version counts as covered even with a pending repeat.
+    Active work absent from the scan follows the observed gaps.
+    """
+    gaps, covered, unchanged = [], 0, 0
+    for observation in observations:
+        path_id = observation["path_id"]
+        success = latest.get(path_id)
+        matches = success and (success["size"], success["mtime"]) == (
+            observation["size"], observation["mtime"]
+        )
+        if matches:
+            covered += 1
+            unchanged += success["completion_run"] != run
+        if not matches or path_id in active:
+            path = paths[path_id]
+            gaps.append({
+                "remote_path": path["remote"], "mapped_path": path["local"],
+                "size": observation["size"], "mtime": observation["mtime"],
+                "state": active[path_id]["state"] if path_id in active else "unresolved",
+                "reason": "explicit_repeat_pending" if matches else "latest_success_does_not_match",
+            })
+    observed_ids = {observation["path_id"] for observation in observations}
+    for path_id, transfer in active.items():
+        if path_id not in observed_ids:
+            path = paths[path_id]
+            gaps.append({"remote_path": path["remote"], "mapped_path": path["local"],
+                         "size": transfer["size"], "mtime": transfer["mtime"], "state": transfer["state"],
+                         "reason": "pending_path_not_observed"})
+    return gaps, covered, unchanged
