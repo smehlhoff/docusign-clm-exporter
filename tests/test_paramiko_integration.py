@@ -20,7 +20,7 @@ from clm_exporter.config import Config
 
 @unittest.skipUnless(importlib.util.find_spec("paramiko"), "Paramiko is not installed; real protocol tests unavailable")
 class ProtocolTests(unittest.TestCase):
-    def exercise(self, trust="trusted", password=None, accepted=True, stall=None, invalid_name=False):
+    def exercise(self, trust="trusted", password=None, accepted=True, stall=None, invalid_name=False, reported_mode=None):
         import paramiko as p
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -56,15 +56,21 @@ class ProtocolTests(unittest.TestCase):
                     release.wait(5)
 
             class Files(p.SFTPServerInterface):
+                def attributes(self, file):
+                    info = p.SFTPAttributes.from_stat(file.lstat())
+                    if reported_mode is not None and file.is_file():
+                        info.st_mode = reported_mode
+                    return info
+
                 def lstat(self, path):
-                    return p.SFTPAttributes.from_stat((source / path.lstrip("/")).lstat())
+                    return self.attributes(source / path.lstrip("/"))
 
                 stat = lstat
 
                 def list_folder(self, path):
                     result = []
                     for file in (source / path.lstrip("/")).iterdir():
-                        info = p.SFTPAttributes.from_stat(file.lstat())
+                        info = self.attributes(file)
                         info.filename = file.name
                         result.append(info)
                     if invalid_name:
@@ -107,8 +113,16 @@ class ProtocolTests(unittest.TestCase):
             watchdog.start()
             started = time.monotonic()
             try:
-                with patch.object(p.SSHClient, "connect", connect), patch("getpass.getpass", return_value=password), redirect_stderr(io.StringIO()):
+                with (
+                    patch.object(p.SSHClient, "connect", connect),
+                    patch("getpass.getpass", return_value=password) as prompt,
+                    redirect_stderr(io.StringIO()),
+                ):
                     code, summary = execute(cfg, "download")
+                if password:
+                    prompt.assert_called_once()
+                else:
+                    prompt.assert_not_called()
                 if stall:
                     self.assertLess(time.monotonic() - started, 3)
                     self.assertEqual(code, 1)
@@ -141,6 +155,9 @@ class ProtocolTests(unittest.TestCase):
 
     def test_encrypted_rsa_transfer(self):
         self.exercise(password="test-only-passphrase")
+
+    def test_pdf_transfer_with_clm_socket_mode(self):
+        self.exercise(reported_mode=0o140640)
 
     def test_unknown_host_rejected(self):
         self.exercise(trust="unknown")

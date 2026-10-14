@@ -37,7 +37,7 @@ class RecordingBar:
 
 class RecordingTqdm:
     def __init__(self):
-        self.bars, self.messages = [], []
+        self.bars = []
 
     def __call__(self, **options):
         bar = RecordingBar(options)
@@ -46,7 +46,6 @@ class RecordingTqdm:
         return bar
 
     def write(self, message, file):
-        self.messages.append(message)
         file.write(message + "\n")
 
 
@@ -70,6 +69,17 @@ class ProgressTests(unittest.TestCase):
 
     def bars(self, unit):
         return [bar for bar in self.display.bars if bar.options["unit"] == unit]
+
+    def invoke_cli(self, *options):
+        stdout = io.StringIO()
+
+        def run(cfg, command, *args, **kwargs):
+            return execute(cfg, command, *args, remote_factory=self.remote.factory, **kwargs)
+
+        with redirect_stdout(stdout), patch("clm_exporter.cli.load", return_value=self.cfg), \
+             patch("clm_exporter.cli.execute", side_effect=run):
+            code = main(["download", "--config", "unused.toml", *options])
+        return code, json.loads(stdout.getvalue())
 
     def test_scan_has_unknown_total_and_transfer_counts_written_bytes(self):
         self.remote.add("dir/a.pdf", b"12345")
@@ -137,48 +147,34 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(self.bars("B")[0].n, 0)
         self.assertTrue(all(bar.closed for bar in self.display.bars))
 
-    def test_nonterminal_and_opt_out_do_not_require_tqdm(self):
-        self.remote.add("a.pdf")
-        for stream, progress in ((io.StringIO(), True), (Terminal(), False)):
-            with self.subTest(progress=progress), redirect_stderr(stream), patch("clm_exporter.progress.load_tqdm", side_effect=AssertionError("must not import")):
-                code, _ = execute(self.cfg, "inventory", remote_factory=self.remote.factory, progress=progress)
-            self.assertEqual(code, 0)
-            self.assertNotIn("\r", stream.getvalue())
+    def test_cli_nonterminal_and_opt_out_do_not_require_tqdm(self):
+        for name, stream, options in (
+            ("redirected", io.StringIO(), ()),
+            ("disabled", Terminal(), ("--no-progress",)),
+        ):
+            with self.subTest(mode=name), redirect_stderr(stream), \
+                 patch("clm_exporter.progress.load_tqdm", side_effect=AssertionError("must not import")):
+                self.remote.add(f"{name}.pdf")
+                code, summary = self.invoke_cli(*options)
+                self.assertEqual(code, 0)
+                self.assertEqual(summary["new_successes"], 1)
+                self.assertEqual((self.cfg.export / f"{name}.pdf").read_bytes(), b"pdf")
+                self.assertNotIn("\r", stream.getvalue())
 
+    @unittest.skipUnless(importlib.util.find_spec("tqdm"), "tqdm is not installed; real rendering test unavailable")
     def test_interactive_cli_keeps_stdout_json_and_file_logs_clean(self):
         self.remote.add("line\nbreak.pdf")
-        stdout = io.StringIO()
-        def run(cfg, command, *args, **kwargs):
-            return execute(cfg, command, *args, remote_factory=self.remote.factory, **kwargs)
-        with redirect_stdout(stdout), redirect_stderr(self.stderr), patch("clm_exporter.cli.load", return_value=self.cfg), \
-             patch("clm_exporter.cli.execute", side_effect=run), patch("clm_exporter.progress.load_tqdm", return_value=self.display):
-            code = main(["download", "--config", "unused.toml"])
-        summary = json.loads(stdout.getvalue())
+        with redirect_stderr(self.stderr):
+            code, summary = self.invoke_cli()
         self.assertEqual(code, 0)
         self.assertEqual(summary["new_successes"], 1)
         self.assertIn("Scanning", self.stderr.getvalue())
-        self.assertTrue(self.display.messages)
+        self.assertIn("Files processed", self.stderr.getvalue())
+        self.assertIn("Downloaded", self.stderr.getvalue())
         self.assertNotIn("\r", Path(summary["reports"]["log"]).read_text())
-        self.assertIn("\\n", self.bars("B")[0].options["desc"])
-        self.assertNotIn("\n", self.bars("B")[0].options["desc"])
-
-    def test_cli_no_progress_flag(self):
-        with redirect_stdout(io.StringIO()), patch("clm_exporter.cli.load", return_value=self.cfg), \
-             patch("clm_exporter.cli.execute", return_value=(0, {})) as run:
-            self.assertEqual(main(["download", "--config", "unused.toml", "--no-progress"]), 0)
-        self.assertFalse(run.call_args.kwargs["progress"])
+        self.assertIn("Receiving 'line\\nbreak.pdf'", self.stderr.getvalue())
+        self.assertNotIn("line\nbreak.pdf", self.stderr.getvalue())
 
     def test_missing_tqdm_has_actionable_error(self):
         with patch.dict("sys.modules", {"tqdm": None}), self.assertRaisesRegex(FatalError, "requirements.txt or use --no-progress"):
             Progress(stream=Terminal())
-
-    @unittest.skipUnless(importlib.util.find_spec("tqdm"), "tqdm is not installed; real rendering test unavailable")
-    def test_real_tqdm_renders_to_terminal_and_closes(self):
-        from tqdm import tqdm
-        stream = Terminal()
-        display = Progress(stream=stream)
-        with display.bar(desc="Reading", total=4, unit="B", unit_scale=True) as bar:
-            bar.update(4)
-        self.assertIn("Reading", stream.getvalue())
-        self.assertIn("100%", stream.getvalue())
-        self.assertNotIn(bar, tqdm._instances)

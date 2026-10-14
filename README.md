@@ -4,6 +4,10 @@ Download PDFs from CLM over SFTP, preserving folders and download history across
 download batches. Requires macOS or Linux and [uv](https://docs.astral.sh/uv/getting-started/installation/).
 The commands below use uv to install and run Python 3.12.
 
+PDFs are selected by a case-insensitive `.pdf` filename ending. SFTP file-type
+labels do not exclude PDFs; directories are traversed, including those named
+with a `.pdf` ending. Downloads still require valid size and modification time.
+
 From this directory:
 
 ```bash

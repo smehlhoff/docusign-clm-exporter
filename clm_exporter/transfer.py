@@ -144,7 +144,7 @@ class Transfers:
         if force_path is not None:
             path = self.db.execute("SELECT * FROM paths WHERE remote=? AND last_seen_run=? AND selected=1", (force_path, self.run)).fetchone()
             if path is None or path["size"] is None or path["mtime"] is None:
-                self.state.error(self.run, force_path, "force", "source_unavailable", "Forced path is not a current regular PDF with complete metadata")
+                self.state.error(self.run, force_path, "force", "source_unavailable", "Forced path is not a current PDF with complete metadata")
             else:
                 with self.state.transaction():
                     self.state.job(path, self.run, forced=True)

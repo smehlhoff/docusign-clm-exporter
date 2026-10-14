@@ -47,8 +47,7 @@ def entry_metadata(attrs):
 
 
 def file_metadata(attrs):
-    if entry_kind(attrs) != "file":
-        raise MetadataError("Entry is no longer a regular file or lacks file type")
+    """Validate download metadata independently of the reported SFTP file type."""
     size, mtime = entry_metadata(attrs)
     if size is None or mtime is None:
         raise MetadataError("Entry lacks valid size or modification time")

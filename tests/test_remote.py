@@ -82,37 +82,28 @@ class AdapterTests(unittest.TestCase):
         self.client.get_transport().set_keepalive.assert_called_once_with(30)
         self.client.open_sftp().get_channel().settimeout.assert_called_once_with(60)
 
-    def test_protected_key_prompts_only_in_memory(self):
-        key = object()
-        self.module.RSAKey.from_private_key_file.side_effect = [PasswordRequiredException(), key]
-        with patch("clm_exporter.remote.getpass.getpass", return_value="secret") as prompt:
-            remote = self.remote()
-        self.assertEqual(remote.key, key)
-        prompt.assert_called_once()
-        self.module.RSAKey.from_private_key_file.assert_called_with(str(self.cfg.private_key_path), password="secret")
-
     def test_invalid_rsa_key_is_fatal_without_connection(self):
         self.module.RSAKey.from_private_key_file.side_effect = SSHException("bad key")
         with self.assertRaises(FatalError):
             self.remote()
         self.client.connect.assert_not_called()
 
-    def test_unknown_host_is_fatal(self):
-        def handshake(**kwargs):
+    def test_security_rejections_are_fatal_without_retry(self):
+        def unknown_host(**kwargs):
             policy = self.client.set_missing_host_key_policy.call_args.args[0]
             policy.missing_host_key(self.client, "unknown.example", Mock())
-        self.client.connect.side_effect = handshake
-        with self.assertRaisesRegex(FatalError, "Untrusted SSH host key"):
-            self.remote().connect()
-        self.assertEqual(self.client.connect.call_count, 1)
 
-    def test_mismatched_host_and_invalid_credentials_are_fatal(self):
-        for failure in (BadHostKeyException("mismatch"), AuthenticationException("rejected")):
-            self.client.connect.reset_mock()
-            self.client.connect.side_effect = failure
-            with self.assertRaises(FatalError):
-                self.remote().connect()
-            self.assertEqual(self.client.connect.call_count, 1)
+        for failure, message in (
+            (unknown_host, "Untrusted SSH host key"),
+            (BadHostKeyException("mismatch"), "host-key verification failed"),
+            (AuthenticationException("rejected"), "authentication.*failed"),
+        ):
+            with self.subTest(failure=message):
+                self.client.connect.reset_mock()
+                self.client.connect.side_effect = failure
+                with self.assertRaisesRegex(FatalError, message):
+                    self.remote().connect()
+                self.assertEqual(self.client.connect.call_count, 1)
 
     def test_connection_and_reconnection_budgets_are_bounded(self):
         self.client.connect.side_effect = ConnectionError("down")

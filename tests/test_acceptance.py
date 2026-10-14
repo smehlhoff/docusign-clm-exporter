@@ -109,11 +109,13 @@ class ExportTests(unittest.TestCase):
         self.remote.add("not.txt")
         self.remote.add("link.pdf", kind="symlink")
         self.remote.add("pipe.pdf", kind="special")
+        # Missing listing metadata must be recovered by stat before transfer.
+        self.remote.list_missing_attrs.add("x.pdf/nested/C.pDf")
         code, summary = self.invoke()
         self.assertEqual(code, 0)
-        self.assertEqual(summary["pdfs_discovered"], 4)
+        self.assertEqual(summary["pdfs_discovered"], 6)
         self.assertEqual(summary["zero_byte_pdfs"], 1)
-        self.assertEqual(len(self.remote.opens), 4)
+        self.assertEqual(len(self.remote.opens), 6)
         self.assertEqual((self.cfg.export / "x.pdf/nested/C.pDf").read_bytes(), b"pdf")
         self.assertFalse((self.cfg.export / "not.txt").exists())
         self.assertTrue(summary["local_download_complete"])
@@ -372,12 +374,7 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(summary["local_download_complete"])
 
-    def test_missing_listing_attributes_are_queried(self):
-        self.remote.add("a.pdf")
-        self.remote.list_missing_attrs.add("a.pdf")
-        self.assertEqual(self.invoke()[0], 0)
-
-    def test_invalid_remote_type_is_reported_without_aborting_siblings(self):
+    def test_invalid_remote_file_type_does_not_block_pdf_downloads(self):
         self.remote.add("a.pdf")
         self.remote.add("z.pdf")
         original = self.remote.lstat
@@ -390,11 +387,11 @@ class ExportTests(unittest.TestCase):
 
         self.remote.lstat = malformed
         code, summary = self.invoke()
-        self.assertEqual(code, 2)
-        self.assertEqual(self.remote.opens, ["z.pdf"])
-        self.assertIn("missing_metadata", [e["category"] for e in self.csv(summary, "unresolved")])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.remote.opens, ["a.pdf", "z.pdf"])
+        self.assertTrue(summary["local_download_complete"])
 
-    def test_permissions_without_file_type_are_queried_and_reported(self):
+    def test_permissions_without_file_type_still_select_pdf(self):
         self.remote.add("a.pdf")
         original_list = self.remote.iterdir
         original_stat = self.remote.lstat
@@ -414,11 +411,11 @@ class ExportTests(unittest.TestCase):
             return info
 
         self.remote.lstat = stat_missing_type
-        code, summary = self.invoke("reconcile")
-        self.assertEqual(code, 2)
-        self.assertFalse(summary["scan_complete"])
-        self.assertFalse(summary["local_download_complete"])
-        self.assertIn("missing_metadata", [e["category"] for e in self.csv(summary, "unresolved")])
+        code, summary = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertTrue(summary["scan_complete"])
+        self.assertTrue(summary["local_download_complete"])
+        self.assertEqual(self.remote.opens, ["a.pdf"])
 
     def test_unavailable_before_success_is_not_hidden(self):
         self.remote.add("dir/a.pdf")
@@ -432,22 +429,20 @@ class ExportTests(unittest.TestCase):
         self.remote.add("dir/a.pdf")
         self.assertEqual(self.invoke()[0], 0)
 
-    def test_pdf_replaced_by_another_type_remains_unresolved(self):
-        for kind in ("directory", "symlink", "special"):
-            with self.subTest(kind=kind):
-                name = kind + ".pdf"
-                self.remote.add(name)
-                self.invoke("inventory")
-                self.remote.add(name, kind=kind)
-                code, summary = self.invoke("reconcile")
-                self.assertEqual(code, 2)
-                self.assertFalse(summary["local_download_complete"])
-                self.assertIn(name, [e["remote_path"] for e in self.csv(summary, "unresolved")
-                                     if e["operation"] == "availability"])
-                del self.remote.entries[name]
-                self.assertEqual(self.invoke("reconcile")[0], 2)
-                self.remote.add(name)
-                self.assertEqual(self.invoke()[0], 0)
+    def test_pdf_replaced_by_directory_remains_unresolved(self):
+        name = "directory.pdf"
+        self.remote.add(name)
+        self.invoke("inventory")
+        self.remote.add(name, kind="directory")
+        code, summary = self.invoke("reconcile")
+        self.assertEqual(code, 2)
+        self.assertFalse(summary["local_download_complete"])
+        self.assertIn(name, [e["remote_path"] for e in self.csv(summary, "unresolved")
+                             if e["operation"] == "availability"])
+        del self.remote.entries[name]
+        self.assertEqual(self.invoke("reconcile")[0], 2)
+        self.remote.add(name)
+        self.assertEqual(self.invoke()[0], 0)
 
     def test_inaccessible_directory_does_not_imply_deletion(self):
         self.remote.add("dir/a.pdf")
@@ -516,6 +511,10 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(summary["forced_successes"], 1)
         self.assertEqual(self.remote.opens, ["a.pdf", "b.pdf", "a.pdf"])
+        staged = {row["remote_path"]: row for row in self.csv(summary, "staging")}
+        self.assertEqual(staged["a.pdf"]["forced"], "1")
+        self.assertEqual(staged["a.pdf"]["payload_status"], "staged")
+        self.assertEqual(staged["b.pdf"]["forced"], "0")
         self.cfg = replace(self.cfg, max_staged_bytes=6)
         self.assertEqual(self.invoke(force_path="b.pdf")[1]["stop_reason"], "batch_capacity")
         self.assertEqual(self.invoke("reconcile")[0], 2)
@@ -584,16 +583,23 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
             self.assertEqual(db.execute("SELECT COUNT(*) FROM transfers WHERE state='downloaded'").fetchone()[0], 1)
         Path(summary["reports"]["downloads"]).unlink()
-        self.invoke("status", report_run=summary["run_id"])
+        original_backup = Path(summary["reports"]["backup"])
+        original_bytes = original_backup.read_bytes()
+        code, rebuilt = self.invoke("status", report_run=summary["run_id"])
+        self.assertEqual(code, 0)
+        self.assertEqual(count, self.remote.connections)
         self.assertEqual(len(self.csv(summary, "downloads")), 1)
+        backup = Path(rebuilt["reports"]["backup"])
+        self.assertNotEqual(backup, original_backup)
+        self.assertTrue(backup.is_file())
+        self.assertEqual(original_backup.read_bytes(), original_bytes)
+        with closing(sqlite3.connect(backup)) as db:
+            saved = json.loads(db.execute("SELECT summary FROM runs WHERE id=?", (summary["run_id"],)).fetchone()[0])
+        self.assertEqual(saved["reports"]["backup"], str(backup))
 
-    def test_missing_state_binding_and_schema_fail_closed(self):
+    def test_initialization_and_schema_fail_closed(self):
         with self.assertRaises(FatalError):
             self.invoke("init")
-        self.cfg = replace(self.cfg, username="different")
-        with self.assertRaises(FatalError):
-            self.invoke("status")
-        self.cfg = replace(self.cfg, username="operator")
         with closing(sqlite3.connect(self.cfg.database)) as db:
             db.execute("PRAGMA user_version=99")
         with self.assertRaises(FatalError):
@@ -624,7 +630,7 @@ class ExportTests(unittest.TestCase):
         self.assertTrue(summary["local_download_complete"])
 
     def test_unavailable_pending_version_is_not_covered_by_older_success(self):
-        for replacement in (None, "directory", "symlink"):
+        for replacement in (None, "directory"):
             with self.subTest(replacement=replacement):
                 name = f"{replacement}.pdf"
                 self.remote.add(name, b"old")
@@ -671,21 +677,6 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(summary["forced_successes"], 1)
         self.assertEqual((self.cfg.export / "a.pdf").read_bytes(), b"old")
 
-    def test_reconstructed_report_names_its_new_backup(self):
-        self.remote.add("a.pdf")
-        _, original = self.invoke()
-        original_backup = Path(original["reports"]["backup"])
-        original_bytes = original_backup.read_bytes()
-        code, rebuilt = self.invoke("status", report_run=original["run_id"])
-        self.assertEqual(code, 0)
-        backup = Path(rebuilt["reports"]["backup"])
-        self.assertNotEqual(backup, original_backup)
-        self.assertTrue(backup.is_file())
-        self.assertEqual(original_backup.read_bytes(), original_bytes)
-        with closing(sqlite3.connect(backup)) as db:
-            saved = json.loads(db.execute("SELECT summary FROM runs WHERE id=?", (original["run_id"],)).fetchone()[0])
-        self.assertEqual(saved["reports"]["backup"], str(backup))
-
     def test_reconstructed_status_keeps_its_original_scan(self):
         self.remote.add("a.pdf")
         _, inventory = self.invoke("inventory")
@@ -727,14 +718,6 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(len(backups), 1)
         with closing(sqlite3.connect(backups.pop())) as db:
             self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
-
-    def test_staging_manifest_includes_forced_and_payload_status(self):
-        self.remote.add("a.pdf")
-        self.invoke()
-        _, summary = self.invoke(force_path="a.pdf")
-        row = self.csv(summary, "staging")[0]
-        self.assertEqual(row["forced"], "1")
-        self.assertEqual(row["payload_status"], "staged")
 
     def test_50000_entry_inventory(self):
         for number in range(50_000):
@@ -888,13 +871,14 @@ class ExportTests(unittest.TestCase):
         with self.assertRaises(PathError):
             execute(cfg, "status")
 
-    def test_source_binding_includes_root_and_destination(self):
+    def test_state_is_bound_to_source_and_destination(self):
         original = self.cfg
-        for field, value in [("remote_root", "/other"), ("host", "other.test"),
+        for field, value in [("username", "different"), ("remote_root", "/other"), ("host", "other.test"),
                              ("port", 2222), ("export_folder_name", "Other-export")]:
-            self.cfg = replace(original, **{field: value})
-            with self.assertRaises(FatalError):
-                self.invoke("status")
+            with self.subTest(field=field):
+                self.cfg = replace(original, **{field: value})
+                with self.assertRaisesRegex(FatalError, "bound to a different source or destination"):
+                    self.invoke("status")
         self.cfg = original
 
     def test_reports_refuse_symlinked_state_directories(self):

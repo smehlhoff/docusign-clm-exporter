@@ -20,7 +20,7 @@ LOG = logging.getLogger("clm_exporter")
 
 
 def parser():
-    result = argparse.ArgumentParser(description="Export regular CLM SFTP PDFs with persistent download history.")
+    result = argparse.ArgumentParser(description="Export CLM SFTP PDFs with persistent download history.")
     commands = result.add_subparsers(dest="command", required=True)
     for command in ("init", "inventory", "download", "status", "reconcile"):
         sub = commands.add_parser(command)

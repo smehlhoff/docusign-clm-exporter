@@ -57,7 +57,9 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
                         continue
                     attrs = entry
                     attribute_error = None
-                    if entry_kind(attrs) == "unknown" or any(getattr(attrs, n, None) is None for n in ("st_size", "st_mtime")):
+                    is_pdf = name.casefold().endswith(".pdf")
+                    if (not is_pdf and entry_kind(attrs) == "unknown"
+                            or any(getattr(attrs, n, None) is None for n in ("st_size", "st_mtime"))):
                         try:
                             attrs = remote.lstat(relative)
                         except (OSError, EOFError, MetadataError) as exc:
@@ -67,7 +69,11 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
                                              ("st_mode", "st_size", "st_mtime", "st_atime", "st_uid", "st_gid")},
                                             ensure_ascii=True)
                     kind = entry_kind(attrs)
-                    selected = kind == "file" and name.casefold().endswith(".pdf")
+                    selected = is_pdf and kind != "directory"
+                    if selected:
+                        # CLM can label downloadable PDFs as special or unknown.
+                        # Preserve the reported mode in attributes for diagnostics.
+                        kind = "file"
                     try:
                         size, mtime = file_metadata(attrs) if kind == "file" else entry_metadata(attrs)
                     except MetadataError as exc:
