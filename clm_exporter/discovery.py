@@ -33,7 +33,17 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
         db.execute("UPDATE runs SET scan_started_at=?,scan_status='running' WHERE id=?", (utcnow(), run))
         db.execute("INSERT INTO scans VALUES(?,'','pending')", (run,))
     queue = deque([""])
-    complete, observed, last_progress = True, 0, time.monotonic()
+    complete = True
+    observed = processed = 0
+    last_progress = time.monotonic()
+
+    def report_progress():
+        nonlocal last_progress
+        now = time.monotonic()
+        if now - last_progress >= 5:
+            LOG.info("Discovery: %d entries examined, %d directories processed, %d directories queued; directory %r",
+                     observed, processed, len(queue), directory or ".")
+            last_progress = now
 
     while queue:
         directory = queue.popleft()
@@ -91,9 +101,7 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
                         LOG.info("Skipping %s: %r", kind, relative)
                     if len(batch) >= 500:
                         _save_observations(state, run, batch)
-                    if time.monotonic() - last_progress >= 5:
-                        LOG.info("Discovery: %d entries examined, %d directories queued", observed, len(queue))
-                        last_progress = time.monotonic()
+                    report_progress()
                 _save_observations(state, run, batch)
                 directory_ok = True
                 with state.transaction():
@@ -117,12 +125,17 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
                                     (directory, run)).fetchall():
                 db.execute("INSERT OR IGNORE INTO scans VALUES(?,?,'pending')", (run, child[0]))
                 queue.append(child[0])
+        # Empty directories produce no entries, but still advance discovery.
+        # Count each directory once, including failed scans after their retries.
+        processed += 1
+        report_progress()
     _record_unavailable_paths(state, run)
     with state.transaction():
         db.execute("UPDATE runs SET scan_status=?,scan_ended_at=? WHERE id=?",
                    ("complete" if complete else "incomplete", utcnow(), run))
         _schedule_transfers(state, run)
-    LOG.info("Discovery %s: %d entries examined", "complete" if complete else "incomplete", observed)
+    LOG.info("Discovery %s: %d entries examined, %d directories processed",
+             "complete" if complete else "incomplete", observed, processed)
     return complete
 
 

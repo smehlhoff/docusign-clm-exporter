@@ -6,7 +6,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from clm_exporter.cli import execute, main
 from clm_exporter.config import Config
@@ -96,6 +96,38 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual((byte_bar.n, byte_bar.options["total"]), (5, 5))
         self.assertEqual(byte_bar.options["unit_divisor"], 1000)
         self.assertTrue(all(bar.closed for bar in self.display.bars))
+
+    def test_empty_directories_report_rate_limited_progress_with_or_without_bars(self):
+        for number in range(6):
+            self.remote.add(f"empty-{number}", kind="directory")
+
+        for enabled in (True, False):
+            with self.subTest(progress=enabled):
+                clock = Mock(return_value=0)
+                self.stderr = Terminal()
+
+                def scan_empty_directory(directory, clock=clock):
+                    if directory:
+                        clock.return_value += 2
+
+                self.remote.list_hook = scan_empty_directory
+                with patch("clm_exporter.discovery.time.monotonic", clock):
+                    code, summary = self.invoke("inventory", progress=enabled)
+
+                self.assertEqual(code, 0)
+                self.assertTrue(summary["scan_complete"])
+                self.assertFalse(self.remote.opens)
+                log = Path(summary["reports"]["log"]).read_text()
+                messages = [line.split(" INFO ", 1)[1] for line in log.splitlines()
+                            if " INFO Discovery:" in line]
+                # Six two-second scans should produce two updates, even though
+                # no entries arrive after the root listing. Counts include root.
+                self.assertEqual(len(messages), 2)
+                self.assertIn("6 entries examined, 4 directories processed, 3 directories queued", messages[0])
+                self.assertIn("6 entries examined, 7 directories processed, 0 directories queued", messages[1])
+                for message in messages:
+                    self.assertIn(message, self.stderr.getvalue())
+                self.assertIn("Discovery complete: 6 entries examined, 7 directories processed", log)
 
     def test_retry_starts_new_bar_with_updated_size(self):
         self.remote.add("a.pdf", b"old")
