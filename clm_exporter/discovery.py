@@ -52,8 +52,10 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
             batch = []
             try:
                 attrs = remote.lstat(directory)
-                if entry_kind(attrs) != "directory":
-                    raise MetadataError("Scanned path is not a real directory or lacks type metadata")
+                if entry_kind(attrs) in ("file", "symlink"):
+                    raise MetadataError("Scanned path is a file or symlink, not a directory")
+                # CLM may report special/missing types even for directories.
+                # A successful listing establishes that this path is a directory.
                 for entry in remote.iterdir(directory):
                     observed += 1
                     bar.update(1)
@@ -67,8 +69,9 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
                         continue
                     attrs = entry
                     attribute_error = None
+                    attribute_operation = "metadata"
                     is_pdf = name.casefold().endswith(".pdf")
-                    if (not is_pdf and entry_kind(attrs) == "unknown"
+                    if (not is_pdf and entry_kind(attrs) in ("special", "unknown")
                             or any(getattr(attrs, n, None) is None for n in ("st_size", "st_mtime"))):
                         try:
                             attrs = remote.lstat(relative)
@@ -79,6 +82,21 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
                                              ("st_mode", "st_size", "st_mtime", "st_atime", "st_uid", "st_gid")},
                                             ensure_ascii=True)
                     kind = entry_kind(attrs)
+                    if not is_pdf and kind in ("special", "unknown"):
+                        # Do not silently exclude a subtree based on CLM's mode.
+                        # Leave failed checks unknown so old children cannot be
+                        # mistaken for deletions through this uninspected entry.
+                        kind = "unknown"
+                        if attribute_error is None:
+                            try:
+                                remote.check_directory(relative)
+                                kind = "directory"
+                            except (OSError, EOFError, MetadataError) as exc:
+                                remote.reconnect(exc)
+                                attribute_error = exc
+                        if attribute_error is not None:
+                            attribute_operation = "directory"
+                            LOG.warning("Cannot verify possible directory %r: %s", relative, attribute_error)
                     selected = is_pdf and kind != "directory"
                     if selected:
                         # CLM can label downloadable PDFs as special or unknown.
@@ -95,7 +113,7 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
                     if attribute_error:
                         # Persist first so saving this observation cannot resolve the new error.
                         _save_observations(state, run, batch)
-                        state.error(run, relative, "metadata", category(attribute_error), attribute_error, attempt)
+                        state.error(run, relative, attribute_operation, category(attribute_error), attribute_error, attempt)
                         complete = False
                     if kind in ("symlink", "special"):
                         LOG.info("Skipping %s: %r", kind, relative)

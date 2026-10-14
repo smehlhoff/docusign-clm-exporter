@@ -17,6 +17,7 @@ class FakeRemote:
         self.denied = set()
         self.missing_attrs = set()
         self.list_missing_attrs = set()
+        self.reported_modes = {}
         self.list_hook = None
         self.open_hook = None
         self.read_hook = None
@@ -54,6 +55,7 @@ class FakeRemote:
             raise FileNotFoundError(relative)
         e = self.entries[relative]
         result = attrs(relative.rpartition("/")[2], e["kind"], len(e["data"]), e["mtime"])
+        result.st_mode = self.reported_modes.get(relative, result.st_mode)
         if relative in self.missing_attrs:
             result.st_size = None
         return result
@@ -67,9 +69,18 @@ class FakeRemote:
         for p in sorted(children, reverse=self.reverse):
             e = self.entries[p]
             result = attrs(p.rpartition("/")[2], e["kind"], len(e["data"]), e["mtime"])
+            result.st_mode = self.reported_modes.get(p, result.st_mode)
             if p in self.missing_attrs or p in self.list_missing_attrs:
                 result.st_size = None
             yield result
+
+    def check_directory(self, relative):
+        if relative in self.denied:
+            raise PermissionError(relative)
+        if relative not in self.entries:
+            raise FileNotFoundError(relative)
+        if self.entries[relative]["kind"] != "directory":
+            raise NotADirectoryError(relative)
 
     def open(self, relative):
         self.opens.append(relative)

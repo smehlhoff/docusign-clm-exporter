@@ -180,6 +180,20 @@ class Remote:
         except self.p.SSHException as exc:
             raise ConnectionError(str(exc)) from exc
 
+    def check_directory(self, relative):
+        """Confirm an ambiguous entry with OPENDIR, without reading its contents."""
+        from paramiko.sftp import CMD_CLOSE, CMD_HANDLE, CMD_OPENDIR
+
+        # Paramiko has no public OPENDIR-only API. Close the handle immediately;
+        # stopping listdir_iter early would leave its directory handle open.
+        try:
+            response, message = self.sftp._request(CMD_OPENDIR, self.absolute(relative))
+            if response != CMD_HANDLE:
+                raise MetadataError("Directory check did not return an SFTP handle")
+            self.sftp._request(CMD_CLOSE, message.get_string())
+        except self.p.SSHException as exc:
+            raise ConnectionError(str(exc)) from exc
+
     @contextmanager
     def open(self, relative):
         try:

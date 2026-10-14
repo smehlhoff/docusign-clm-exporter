@@ -100,7 +100,8 @@ class ProgressTests(unittest.TestCase):
     def test_empty_directories_report_rate_limited_progress_with_or_without_bars(self):
         for number in range(6):
             self.remote.add(f"empty-{number}", kind="directory")
-        self.remote.add("ignored.txt", kind="special")
+        # A known symlink is skipped; ambiguous special entries must be checked.
+        self.remote.add("ignored.txt", kind="symlink")
 
         for enabled in (True, False):
             with self.subTest(progress=enabled):

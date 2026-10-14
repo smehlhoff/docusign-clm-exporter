@@ -453,29 +453,54 @@ class ExportTests(unittest.TestCase):
         errors = self.csv(summary, "unresolved")
         self.assertFalse(any(e["operation"] == "availability" for e in errors))
 
-    def test_unknown_directory_type_does_not_imply_child_deletion(self):
-        self.remote.add("dir/a.pdf")
-        self.invoke("inventory")
-        original_list = self.remote.iterdir
-        original_stat = self.remote.lstat
+    def test_uncheckable_directory_type_does_not_imply_child_deletion(self):
+        self.remote.add("healthy.pdf")
+        version = 0
+        for mode in (None, 0o140750):
+            for failure in (PermissionError("denied"), OSError("server failure"), ConnectionError("dropped")):
+                with self.subTest(mode=mode, failure=failure):
+                    version += 1
+                    self.remote.reported_modes.clear()
+                    self.remote.add("dir/a.pdf", mtime=version)
+                    self.assertEqual(self.invoke("inventory")[0], 0)
+                    self.remote.reported_modes["dir"] = mode
+                    with patch.object(self.remote, "check_directory", side_effect=failure):
+                        code, summary = self.invoke("inventory")
+                    self.assertEqual(code, 2)
+                    self.assertFalse(summary["scan_complete"])
+                    self.assertEqual(summary["pdfs_discovered"], 1)
+                    self.assertIn("Cannot verify possible directory 'dir'", Path(summary["reports"]["log"]).read_text())
+                    errors = self.csv(summary, "unresolved")
+                    self.assertEqual(summary["unresolved_directory_errors"], 1)
+                    self.assertTrue(any(e["remote_path"] == "dir" and e["operation"] == "directory" for e in errors))
+                    self.assertFalse(any(e["operation"] == "availability" for e in errors))
+                    self.assertEqual(self.remote.opens, [])
+                    code, recovered = self.invoke()
+                    self.assertEqual(code, 0)
+                    self.assertTrue(recovered["local_download_complete"])
+                    self.assertEqual(recovered["directories_discovered"], 1)
+                    self.assertEqual(self.csv(recovered, "unresolved"), [])
+                    self.remote.opens.clear()
 
-        def missing_type(directory):
+    def test_special_listing_uses_stat_before_skipping_or_probing(self):
+        self.remote.add("System Admin/Templates/test.pdf")
+        self.remote.add("System Admin/Link", kind="symlink")
+        self.remote.add("System Admin/Link/hidden.pdf")
+        original_list = self.remote.iterdir
+
+        def special_listing(directory):
             for info in original_list(directory):
-                if directory == "" and info.filename == "dir":
-                    info.st_mode = None
+                info.st_mode = 0o140750
                 yield info
 
-        def stat_missing_type(path):
-            info = original_stat(path)
-            if path == "dir":
-                info.st_mode = None
-            return info
-
-        self.remote.iterdir, self.remote.lstat = missing_type, stat_missing_type
-        code, summary = self.invoke("reconcile")
-        self.assertEqual(code, 2)
-        self.assertFalse(summary["scan_complete"])
-        self.assertFalse(any(e["operation"] == "availability" for e in self.csv(summary, "unresolved")))
+        self.remote.iterdir = special_listing
+        with patch.object(self.remote, "check_directory", side_effect=AssertionError("stat established the type")):
+            code, summary = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertTrue(summary["scan_complete"])
+        self.assertEqual(self.remote.opens, ["System Admin/Templates/test.pdf"])
+        self.assertEqual(summary["directories_discovered"], 2)
+        self.assertEqual((self.cfg.export / "System Admin/Templates/test.pdf").read_bytes(), b"pdf")
 
     def test_transient_retry_budget_and_next_invocation(self):
         self.remote.add("a.pdf")

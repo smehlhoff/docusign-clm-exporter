@@ -7,6 +7,10 @@ The commands below use uv to install and run Python 3.12.
 PDFs are selected by a case-insensitive `.pdf` filename ending. SFTP file-type
 labels do not exclude PDFs; directories are traversed, including those named
 with a `.pdf` ending. Downloads still require valid size and modification time.
+For non-PDF entries labeled `special` or missing a type, inventory checks `lstat`
+and, if still ambiguous, opens and immediately closes a directory handle to
+confirm traversal. A failed check is reported and makes the scan incomplete;
+it cannot silently hide a subtree. Known directory symlinks are not traversed.
 
 From this directory:
 

@@ -20,7 +20,8 @@ from clm_exporter.config import Config
 
 @unittest.skipUnless(importlib.util.find_spec("paramiko"), "Paramiko is not installed; real protocol tests unavailable")
 class ProtocolTests(unittest.TestCase):
-    def exercise(self, trust="trusted", password=None, accepted=True, stall=None, invalid_name=False, reported_mode=None):
+    def exercise(self, trust="trusted", password=None, accepted=True, stall=None, invalid_name=False,
+                 reported_mode=None, directory_mode=None):
         import paramiko as p
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -32,6 +33,13 @@ class ProtocolTests(unittest.TestCase):
             source = root / "source"
             source.mkdir()
             (source / "Example.PDF").write_bytes(b"fixture content selected by extension")
+            pdfs = ["Example.PDF"]
+            if directory_mode is not None:
+                nested = "System Admin/Templates/1/2/3/test.pdf"
+                (source / nested).parent.mkdir(parents=True)
+                (source / nested).write_bytes(b"nested PDF")
+                (source / "System Admin/Templates/Empty").mkdir()
+                pdfs.append(nested)
 
             release = threading.Event()
 
@@ -60,6 +68,8 @@ class ProtocolTests(unittest.TestCase):
                     info = p.SFTPAttributes.from_stat(file.lstat())
                     if reported_mode is not None and file.is_file():
                         info.st_mode = reported_mode
+                    if directory_mode is not None and file.is_dir():
+                        info.st_mode = directory_mode
                     return info
 
                 def lstat(self, path):
@@ -136,8 +146,12 @@ class ProtocolTests(unittest.TestCase):
                     self.assertTrue(Path(summary["reports"]["backup"]).exists())
                 elif trust == "trusted" and accepted:
                     self.assertEqual(code, 0)
-                    self.assertEqual(summary["new_successes"], 1)
-                    self.assertEqual((cfg.export / "Example.PDF").read_bytes(), (source / "Example.PDF").read_bytes())
+                    self.assertTrue(summary["scan_complete"])
+                    self.assertEqual(summary["new_successes"], len(pdfs))
+                    for relative in pdfs:
+                        self.assertEqual((cfg.export / relative).read_bytes(), (source / relative).read_bytes())
+                    if directory_mode is not None:
+                        self.assertEqual(summary["directories_discovered"], 6)
                 else:
                     self.assertEqual(code, 1)
                     self.assertEqual(summary["historical_successful_transfers"], 0)
@@ -156,8 +170,10 @@ class ProtocolTests(unittest.TestCase):
     def test_encrypted_rsa_transfer(self):
         self.exercise(password="test-only-passphrase")
 
-    def test_pdf_transfer_with_clm_socket_mode(self):
-        self.exercise(reported_mode=0o140640)
+    def test_nested_transfer_with_clm_special_types(self):
+        for directory_mode in (0o140750, 0o750):
+            with self.subTest(directory_mode=oct(directory_mode)):
+                self.exercise(reported_mode=0o140640, directory_mode=directory_mode)
 
     def test_unknown_host_rejected(self):
         self.exercise(trust="unknown")
