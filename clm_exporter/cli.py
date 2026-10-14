@@ -58,17 +58,17 @@ def execute(cfg, command, force_path=None, report_run=None, remote_factory=Remot
                     state.backup(backup_run)
                 return outcome(previous["command"], summary), summary
             run = state.run(command)
-            file_handler = logging.FileHandler(cfg.reports / f"run-{run}.log", encoding="utf-8")
-            stream_handler = ProgressHandler(display)
+            if command != "init":
+                handlers.append(logging.FileHandler(cfg.reports / f"run-{run}.log", encoding="utf-8"))
+            handlers.append(ProgressHandler(display))
             formatter = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s")
             formatter.converter = time.gmtime
-            for handler in (file_handler, stream_handler):
+            for handler in handlers:
                 handler.setFormatter(formatter)
                 if command == "inventory":
                     handler.addFilter(lambda record: record.levelno >= logging.WARNING
                                       or record.getMessage().startswith("Discovery"))
                 LOG.addHandler(handler)
-                handlers.append(handler)
             LOG.setLevel(logging.INFO)
             LOG.propagate = False
             reason, code = "completed", None

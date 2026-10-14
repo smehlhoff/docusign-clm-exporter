@@ -51,7 +51,7 @@ def write_reports(state, run, scan_run=None, backup_run=None):
     locations["log"] = f"{base}.log"
     locations["backup"] = str(cfg.backups / f"export-{backup_run or run}.sqlite3")
     if record["command"] == "init":
-        locations = {name: locations[name] for name in ("summary", "log", "backup")}
+        locations = {"backup": locations["backup"]}
 
     def write_csv(name, fields, rows):
         if name in locations:
@@ -172,5 +172,6 @@ def write_reports(state, run, scan_run=None, backup_run=None):
     # Persist summary before file output so a report-write interruption is reconstructable.
     with state.transaction():
         db.execute("UPDATE runs SET summary=? WHERE id=?", (json.dumps(summary), run))
-    atomic_write(Path(locations["summary"]), lambda f: json.dump(summary, f, indent=2, ensure_ascii=True))
+    if "summary" in locations:
+        atomic_write(Path(locations["summary"]), lambda f: json.dump(summary, f, indent=2, ensure_ascii=True))
     return summary

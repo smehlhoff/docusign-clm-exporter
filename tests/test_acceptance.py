@@ -623,6 +623,10 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(saved["reports"]["backup"], str(backup))
 
     def test_initialization_and_schema_fail_closed(self):
+        self.assertEqual(list(self.cfg.reports.iterdir()), [])
+        initialized = json.loads(self.rows("SELECT summary FROM runs WHERE command='init'")[0][0])
+        self.assertEqual(set(initialized["reports"]), {"backup"})
+        self.assertTrue(Path(initialized["reports"]["backup"]).is_file())
         with self.assertRaises(FatalError):
             self.invoke("init")
         with closing(sqlite3.connect(self.cfg.database)) as db:

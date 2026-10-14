@@ -43,6 +43,9 @@ uv run --python 3.12 python -m clm_exporter init --config ./config.toml
 uv run --python 3.12 python -m clm_exporter download --config ./config.toml
 ```
 
+`init` leaves `reports/` empty. It prints its summary to the terminal and saves
+the database and its backup under `state/`.
+
 Repeat `download` for later batches. It skips unchanged completed files even after
 local cleanup, downloads files whose size or modification time changed, and retries
 unfinished work. Keep `state/`; never reinitialize between batches.
