@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from clm_exporter.config import Config
 from clm_exporter.errors import FatalError, MetadataError
@@ -117,6 +117,27 @@ class AdapterTests(unittest.TestCase):
         with remote.open("dir/a.pdf"):
             pass
         sftp.open.assert_called_once_with("/root/dir/a.pdf", "rb", bufsize=0)
+
+    def test_directory_handle_close_failure_cannot_look_like_a_rejected_probe(self):
+        remote = self.remote()
+        remote.connect()
+        protocol = SimpleNamespace(CMD_OPENDIR=11, CMD_HANDLE=102, CMD_CLOSE=4)
+        message = Mock()
+        message.get_string.return_value = b"directory-handle"
+        sftp = self.client.open_sftp.return_value
+        sftp._request.side_effect = [(protocol.CMD_HANDLE, message), OSError("Failure")]
+        with (
+            patch.dict("sys.modules", {"paramiko.sftp": protocol}),
+            self.assertRaisesRegex(ConnectionError, "close") as failure,
+        ):
+            remote.check_directory("dir.pdf")
+        self.assertEqual(sftp._request.call_args_list, [
+            call(protocol.CMD_OPENDIR, "/root/dir.pdf"),
+            call(protocol.CMD_CLOSE, b"directory-handle"),
+        ])
+        remote.reconnect(failure.exception)
+        sftp.close.assert_called_once()
+        self.assertEqual(self.client.connect.call_count, 2)
 
 
 if __name__ == "__main__":

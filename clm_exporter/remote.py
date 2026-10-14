@@ -190,7 +190,12 @@ class Remote:
             response, message = self.sftp._request(CMD_OPENDIR, self.absolute(relative))
             if response != CMD_HANDLE:
                 raise MetadataError("Directory check did not return an SFTP handle")
-            self.sftp._request(CMD_CLOSE, message.get_string())
+            try:
+                self.sftp._request(CMD_CLOSE, message.get_string())
+            except OSError as exc:
+                # OPENDIR already confirmed a directory. Reconnect to release
+                # its handle; this is not a negative directory-probe response.
+                raise ConnectionError("Could not close confirmed directory handle") from exc
         except self.p.SSHException as exc:
             raise ConnectionError(str(exc)) from exc
 

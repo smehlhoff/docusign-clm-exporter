@@ -71,7 +71,7 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
                     attribute_error = None
                     attribute_operation = "metadata"
                     is_pdf = name.casefold().endswith(".pdf")
-                    if (not is_pdf and entry_kind(attrs) in ("special", "unknown")
+                    if (entry_kind(attrs) in ("special", "unknown")
                             or any(getattr(attrs, n, None) is None for n in ("st_size", "st_mtime"))):
                         try:
                             attrs = remote.lstat(relative)
@@ -82,7 +82,8 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
                                              ("st_mode", "st_size", "st_mtime", "st_atime", "st_uid", "st_gid")},
                                             ensure_ascii=True)
                     kind = entry_kind(attrs)
-                    if not is_pdf and kind in ("special", "unknown"):
+                    verified_non_directory = kind in ("file", "symlink")
+                    if kind in ("special", "unknown"):
                         # Do not silently exclude a subtree based on CLM's mode.
                         # Leave failed checks unknown so old children cannot be
                         # mistaken for deletions through this uninspected entry.
@@ -93,11 +94,20 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
                                 kind = "directory"
                             except (OSError, EOFError, MetadataError) as exc:
                                 remote.reconnect(exc)
-                                attribute_error = exc
+                                # SFTP v3 uses NO_SUCH_FILE or generic FAILURE
+                                # when OPENDIR targets a file. Keep ambiguous
+                                # PDFs eligible after these rejections, but do
+                                # not hide permission or connection failures.
+                                rejected_pdf = is_pdf and (
+                                    isinstance(exc, (FileNotFoundError, NotADirectoryError))
+                                    or type(exc) is OSError and exc.errno is None
+                                )
+                                if not rejected_pdf:
+                                    attribute_error = exc
                         if attribute_error is not None:
                             attribute_operation = "directory"
                             LOG.warning("Cannot verify possible directory %r: %s", relative, attribute_error)
-                    selected = is_pdf and kind != "directory"
+                    selected = is_pdf and kind != "directory" and attribute_operation != "directory"
                     if selected:
                         # CLM can label downloadable PDFs as special or unknown.
                         # Preserve the reported mode in attributes for diagnostics.
@@ -109,7 +119,7 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
                         attribute_error = attribute_error or exc
                     if kind in ("file", "directory", "unknown") and (size is None or mtime is None or kind == "unknown"):
                         attribute_error = attribute_error or MetadataError("Required entry attributes remain unavailable")
-                    batch.append((relative, directory, name, kind, size, mtime, selected, attributes))
+                    batch.append((relative, directory, name, kind, size, mtime, selected, attributes, verified_non_directory))
                     if attribute_error:
                         # Persist first so saving this observation cannot resolve the new error.
                         _save_observations(state, run, batch)
@@ -163,7 +173,7 @@ def _save_observations(state: State, run: str, batch) -> None:
     if not batch:
         return
     with state.transaction():
-        for relative, parent, name, kind, size, mtime, selected, attributes in batch:
+        for relative, parent, name, kind, size, mtime, selected, attributes, verified_non_directory in batch:
             prior = db.execute("SELECT kind FROM paths WHERE remote=?", (relative,)).fetchone()
             db.execute("""INSERT INTO paths(remote,parent,name,kind,last_seen_run,size,mtime,selected,attributes)
                 VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(remote) DO UPDATE SET
@@ -175,6 +185,10 @@ def _save_observations(state: State, run: str, batch) -> None:
                 mtime=excluded.mtime,selected=excluded.selected,attributes=excluded.attributes""", (run, relative))
             if kind != "unknown" and (not selected or size is not None and mtime is not None):
                 state.resolve(run, relative, ["metadata"])
+            if verified_non_directory:
+                # Only explicit type metadata can retire a failed directory
+                # check; a PDF suffix alone does not establish that it is a file.
+                state.resolve(run, relative, ["directory"])
             if prior and prior["kind"] != kind and prior["kind"] in ("file", "directory"):
                 # The old mapping stays reserved; ownership checks govern reuse.
                 LOG.warning("Remote entry changed type: %r", relative)

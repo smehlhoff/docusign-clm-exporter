@@ -393,6 +393,48 @@ class ExportTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual((self.cfg.export / path).read_bytes(), b"pdf")
 
+    def test_pdf_named_directories_with_ambiguous_types_are_traversed(self):
+        pdfs = []
+        for label, mode in (("missing", None), ("permissions", 0o750), ("special", 0o140750)):
+            folder = f"{label}.PDF"
+            nested = f"{folder}/nested/contract.pdf"
+            document = f"{label}-document.pdf"
+            self.remote.add(nested)
+            self.remote.add(document)
+            self.remote.reported_modes.update({folder: mode, document: mode})
+            pdfs.extend([nested, document])
+
+        code, summary = self.invoke("inventory")
+        self.assertEqual(code, 0)
+        self.assertTrue(summary["scan_complete"])
+        self.assertEqual(summary["directories_discovered"], 6)
+        self.assertEqual(summary["pdfs_discovered"], len(pdfs))
+        self.assertFalse(self.remote.opens)
+        code, summary = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertTrue(summary["local_download_complete"])
+        self.assertEqual(self.remote.opens, sorted(pdfs))
+        for path in pdfs:
+            with self.subTest(path=path):
+                self.assertEqual((self.cfg.export / path).read_bytes(), b"pdf")
+
+    def test_pdf_directory_probe_failures_remain_visible_and_recoverable(self):
+        self.remote.add("folder.pdf/contract.pdf")
+        self.remote.reported_modes["folder.pdf"] = 0o140750
+        for failure in (PermissionError("denied"), ConnectionError("dropped")):
+            with self.subTest(failure=type(failure).__name__):
+                with patch.object(self.remote, "check_directory", side_effect=failure):
+                    code, summary = self.invoke("inventory")
+                self.assertEqual(code, 2)
+                self.assertFalse(summary["scan_complete"])
+                self.assertEqual(summary["unresolved_directory_errors"], 1)
+                self.assertFalse(self.remote.opens)
+                code, summary = self.invoke()
+                self.assertEqual(code, 0)
+                self.assertTrue(summary["local_download_complete"])
+                self.assertEqual((self.cfg.export / "folder.pdf/contract.pdf").read_bytes(), b"pdf")
+                self.remote.opens.clear()
+
     def test_unavailable_before_success_is_not_hidden(self):
         self.remote.add("dir/a.pdf")
         self.invoke("inventory")
@@ -459,7 +501,7 @@ class ExportTests(unittest.TestCase):
                     self.remote.opens.clear()
 
     def test_special_listing_uses_stat_before_skipping_or_probing(self):
-        self.remote.add("System Admin/Templates/test.pdf")
+        self.remote.add("System Admin/Templates.pdf/test.pdf")
         self.remote.add("System Admin/Link", kind="symlink")
         self.remote.add("System Admin/Link/hidden.pdf")
         original_list = self.remote.iterdir
@@ -474,9 +516,35 @@ class ExportTests(unittest.TestCase):
             code, summary = self.invoke()
         self.assertEqual(code, 0)
         self.assertTrue(summary["scan_complete"])
-        self.assertEqual(self.remote.opens, ["System Admin/Templates/test.pdf"])
+        self.assertEqual(self.remote.opens, ["System Admin/Templates.pdf/test.pdf"])
         self.assertEqual(summary["directories_discovered"], 2)
-        self.assertEqual((self.cfg.export / "System Admin/Templates/test.pdf").read_bytes(), b"pdf")
+        self.assertEqual((self.cfg.export / "System Admin/Templates.pdf/test.pdf").read_bytes(), b"pdf")
+
+    def test_reclassified_directories_resolve_scan_errors_but_keep_download_gaps(self):
+        self.remote.add("empty", kind="directory")
+        self.remote.add("pending/unfinished.pdf")
+        self.assertEqual(self.invoke("inventory")[0], 0)
+        self.remote.denied.update({"empty", "pending"})
+        code, summary = self.invoke("inventory")
+        self.assertEqual(code, 2)
+        self.assertEqual(summary["unresolved_directory_errors"], 2)
+
+        self.remote.denied.clear()
+        del self.remote.entries["pending/unfinished.pdf"]
+        for path in ("empty", "pending"):
+            self.remote.add(path, kind="file")
+        code, summary = self.invoke("reconcile")
+        self.assertEqual(code, 2)
+        self.assertTrue(summary["scan_complete"])
+        self.assertEqual(summary["unresolved_directory_errors"], 0)
+        self.assertEqual([(e["remote_path"], e["operation"]) for e in self.csv(summary, "unresolved")],
+                         [("pending/unfinished.pdf", "availability")])
+        self.assertEqual(summary["pending_deferred_count"], 1)
+        self.remote.add("pending", kind="directory")
+        self.remote.add("pending/unfinished.pdf")
+        code, summary = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertTrue(summary["local_download_complete"])
 
     def test_transient_retry_budget_and_next_invocation(self):
         self.remote.add("a.pdf")

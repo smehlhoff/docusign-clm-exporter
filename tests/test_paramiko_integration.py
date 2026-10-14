@@ -35,10 +35,10 @@ class ProtocolTests(unittest.TestCase):
             (source / "Example.PDF").write_bytes(b"fixture content selected by extension")
             pdfs = ["Example.PDF"]
             if directory_mode is not None:
-                nested = "System Admin/Templates/1/2/3/test.pdf"
+                nested = "System Admin/Templates.pdf/1/2/3/test.pdf"
                 (source / nested).parent.mkdir(parents=True)
                 (source / nested).write_bytes(b"nested PDF")
-                (source / "System Admin/Templates/Empty").mkdir()
+                (source / "System Admin/Templates.pdf/Empty").mkdir()
                 pdfs.append(nested)
 
             release = threading.Event()
@@ -78,6 +78,10 @@ class ProtocolTests(unittest.TestCase):
                 stat = lstat
 
                 def list_folder(self, path):
+                    if (source / path.lstrip("/")).is_file():
+                        # SFTP v3 servers may reject OPENDIR on a file using
+                        # either generic FAILURE or NO_SUCH_FILE.
+                        return p.SFTP_FAILURE if directory_mode == 0o140750 else p.SFTP_NO_SUCH_FILE
                     result = []
                     for file in (source / path.lstrip("/")).iterdir():
                         info = self.attributes(file)
