@@ -50,6 +50,13 @@ def write_reports(state, run, scan_run=None, backup_run=None):
     locations["path_map"] = str(cfg.reports / "path-map.csv")
     locations["log"] = f"{base}.log"
     locations["backup"] = str(cfg.backups / f"export-{backup_run or run}.sqlite3")
+    if record["command"] == "init":
+        locations = {name: locations[name] for name in ("summary", "log", "backup")}
+
+    def write_csv(name, fields, rows):
+        if name in locations:
+            csv_file(Path(locations[name]), fields, rows)
+
     latest = {r["path_id"]: r for r in db.execute("""SELECT t.* FROM transfers t
         WHERE t.state='downloaded' AND t.id=(SELECT MAX(t2.id) FROM transfers t2 WHERE t2.path_id=t.path_id AND t2.state='downloaded')""")}
     paths = {r["id"]: r for r in db.execute("SELECT * FROM paths")}
@@ -87,7 +94,7 @@ def write_reports(state, run, scan_run=None, backup_run=None):
             logging.getLogger("clm_exporter").info("Staging manifest: verified %d present PDFs", len(staged))
             progress_at = time.monotonic()
     transfer_fields = ["remote_path", "mapped_path", "size", "mtime", "sha256", "completed_at", "completion_run", "transfer_id", "forced", "zero_byte", "payload_status"]
-    csv_file(Path(locations["staging"]), transfer_fields, staged)
+    write_csv("staging", transfer_fields, staged)
 
     def history_rows(only_run=False):
         for transfer in db.execute("SELECT * FROM transfers WHERE state='downloaded' ORDER BY id"):
@@ -98,16 +105,16 @@ def write_reports(state, run, scan_run=None, backup_run=None):
             yield dict(transfer, remote_path=path["remote"], mapped_path=path["local"], transfer_id=transfer["id"],
                        zero_byte=transfer["size"] == 0,
                        payload_status="superseded" if not is_latest else "staged" if path["id"] in present else "absent_or_unverified")
-    csv_file(Path(locations["downloads"]), transfer_fields, history_rows(True))
-    csv_file(Path(locations["history"]), transfer_fields, history_rows())
-    csv_file(Path(locations["path_map"]), ["remote_path", "mapped_path", "kind", "last_seen_run", "collision_key"],
+    write_csv("downloads", transfer_fields, history_rows(True))
+    write_csv("history", transfer_fields, history_rows())
+    write_csv("path_map", ["remote_path", "mapped_path", "kind", "last_seen_run", "collision_key"],
              (dict(p, remote_path=p["remote"], mapped_path=p["local"]) for p in paths.values()))
     errors = [dict(e, remote_path=e["remote"], mapped_path=e["local"], attempt_count=e["attempts"])
               for e in db.execute("SELECT e.*,p.local FROM errors e LEFT JOIN paths p ON p.remote=e.remote ORDER BY e.id")]
     error_fields = ["run_id", "timestamp", "remote_path", "mapped_path", "operation", "category", "attempt_count", "message", "resolved_at", "resolved_run"]
-    csv_file(Path(locations["failures"]), error_fields, (e for e in errors if e["run_id"] == run))
+    write_csv("failures", error_fields, (e for e in errors if e["run_id"] == run))
     unresolved = [e for e in errors if e["resolved_at"] is None]
-    csv_file(Path(locations["unresolved"]), error_fields, unresolved)
+    write_csv("unresolved", error_fields, unresolved)
     observations = db.execute("SELECT * FROM observations WHERE run_id=? AND selected=1", (scan_run,)).fetchall() if scan_run else []
     active = {t["path_id"]: t for t in db.execute("SELECT * FROM transfers WHERE state IN ('pending','failed','ready','downloading')")}
     gaps, covered, unchanged = [], 0, 0
@@ -129,7 +136,7 @@ def write_reports(state, run, scan_run=None, backup_run=None):
             gaps.append({"remote_path": path["remote"], "mapped_path": path["local"],
                          "size": transfer["size"], "mtime": transfer["mtime"], "state": transfer["state"],
                          "reason": "pending_path_not_observed"})
-    csv_file(Path(locations["gaps"]), ["remote_path", "mapped_path", "size", "mtime", "state", "reason"], gaps)
+    write_csv("gaps", ["remote_path", "mapped_path", "size", "mtime", "state", "reason"], gaps)
     completed = list(db.execute("SELECT * FROM transfers WHERE completion_run=? AND state='downloaded'", (run,)))
     changed = sum(db.execute("SELECT EXISTS(SELECT 1 FROM transfers WHERE path_id=? AND state='downloaded' AND id<?)",
                              (t["path_id"], t["id"])).fetchone()[0] for t in completed)
