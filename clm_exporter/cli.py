@@ -64,6 +64,9 @@ def execute(cfg, command, force_path=None, report_run=None, remote_factory=Remot
             formatter.converter = time.gmtime
             for handler in (file_handler, stream_handler):
                 handler.setFormatter(formatter)
+                if command == "inventory":
+                    handler.addFilter(lambda record: record.levelno >= logging.WARNING
+                                      or record.getMessage().startswith("Discovery"))
                 LOG.addHandler(handler)
                 handlers.append(handler)
             LOG.setLevel(logging.INFO)

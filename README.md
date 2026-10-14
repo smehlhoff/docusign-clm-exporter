@@ -75,6 +75,9 @@ Archive copying and verification are manual. A capacity stop leaves work pending
 it does not mean the export is complete.
 
 Logs, CSV manifests, unresolved errors, and JSON summaries live in `export/reports/`.
+Inventory logs show discovery counts, warnings, and errors. JSON summaries include
+`directories_discovered`: distinct directories observed in the reported scan,
+including empty folders and excluding the configured remote root.
 Exit codes: `0` success or planned capacity stop; `2` unresolved errors or
 reconciliation gaps; `1` fatal error; `130` interrupted.
 

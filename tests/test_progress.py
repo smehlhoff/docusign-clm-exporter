@@ -100,6 +100,7 @@ class ProgressTests(unittest.TestCase):
     def test_empty_directories_report_rate_limited_progress_with_or_without_bars(self):
         for number in range(6):
             self.remote.add(f"empty-{number}", kind="directory")
+        self.remote.add("ignored.txt", kind="special")
 
         for enabled in (True, False):
             with self.subTest(progress=enabled):
@@ -117,17 +118,37 @@ class ProgressTests(unittest.TestCase):
                 self.assertEqual(code, 0)
                 self.assertTrue(summary["scan_complete"])
                 self.assertFalse(self.remote.opens)
+                self.assertEqual(summary["directories_discovered"], 6)
+                saved = json.loads(Path(summary["reports"]["summary"]).read_text())
+                self.assertEqual(saved["directories_discovered"], 6)
                 log = Path(summary["reports"]["log"]).read_text()
                 messages = [line.split(" INFO ", 1)[1] for line in log.splitlines()
                             if " INFO Discovery:" in line]
                 # Six two-second scans should produce two updates, even though
                 # no entries arrive after the root listing. Counts include root.
-                self.assertEqual(len(messages), 2)
-                self.assertIn("6 entries examined, 4 directories processed, 3 directories queued", messages[0])
-                self.assertIn("6 entries examined, 7 directories processed, 0 directories queued", messages[1])
+                self.assertEqual(messages, [
+                    "Discovery: 7 entries examined, 4 directories processed, 3 directories queued",
+                    "Discovery: 7 entries examined, 7 directories processed, 0 directories queued",
+                ])
                 for message in messages:
                     self.assertIn(message, self.stderr.getvalue())
-                self.assertIn("Discovery complete: 6 entries examined, 7 directories processed", log)
+                self.assertIn("Discovery complete: 7 entries examined, 7 directories processed, 0 directories queued", log)
+                for output in (log, self.stderr.getvalue()):
+                    self.assertNotIn("Skipping", output)
+                    self.assertNotIn("Command finished", output)
+
+    def test_inventory_keeps_warnings_and_fatal_errors_visible(self):
+        for failure, code, message in (
+            (PermissionError("listing denied"), 2, "Directory scan failed"),
+            (FatalError("connection unavailable"), 1, "Fatal error"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                self.stderr = Terminal()
+                with patch.object(self.remote, "iterdir", side_effect=failure):
+                    actual, summary = self.invoke("inventory", progress=False)
+                self.assertEqual(actual, code)
+                self.assertIn(message, self.stderr.getvalue())
+                self.assertIn(message, Path(summary["reports"]["log"]).read_text())
 
     def test_retry_starts_new_bar_with_updated_size(self):
         self.remote.add("a.pdf", b"old")

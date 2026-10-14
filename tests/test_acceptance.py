@@ -678,14 +678,19 @@ class ExportTests(unittest.TestCase):
         self.assertEqual((self.cfg.export / "a.pdf").read_bytes(), b"old")
 
     def test_reconstructed_status_keeps_its_original_scan(self):
-        self.remote.add("a.pdf")
+        self.remote.add("old/nested/a.pdf")
+        self.remote.add("removed", kind="directory")
         _, inventory = self.invoke("inventory")
         _, status = self.invoke("status")
+        self.assertEqual(status["directories_discovered"], 3)
+        del self.remote.entries["removed"]
         self.remote.add("b.pdf")
-        self.invoke("inventory")
+        _, current = self.invoke("inventory")
+        self.assertEqual(current["directories_discovered"], 2)
         _, rebuilt = self.invoke("status", report_run=status["run_id"])
         self.assertEqual(rebuilt["scan_run"], inventory["run_id"])
         self.assertEqual(rebuilt["pdfs_discovered"], 1)
+        self.assertEqual(rebuilt["directories_discovered"], 3)
 
     def test_reconstructed_failed_run_preserves_exit_code(self):
         for failure, expected in ((FatalError("connection unavailable"), 1), (KeyboardInterrupt(), 130)):
@@ -725,6 +730,7 @@ class ExportTests(unittest.TestCase):
         code, summary = self.invoke("inventory")
         self.assertEqual(code, 0)
         self.assertEqual(summary["pdfs_discovered"], 50_000)
+        self.assertEqual(summary["directories_discovered"], 50)
         self.assertEqual(summary["pending_deferred_count"], 50_000)
         self.assertEqual(len(self.rows("SELECT id FROM transfers")), 50_000)
         self.assertFalse(self.remote.opens)

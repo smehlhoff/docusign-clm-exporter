@@ -41,8 +41,8 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
         nonlocal last_progress
         now = time.monotonic()
         if now - last_progress >= 5:
-            LOG.info("Discovery: %d entries examined, %d directories processed, %d directories queued; directory %r",
-                     observed, processed, len(queue), directory or ".")
+            LOG.info("Discovery: %d entries examined, %d directories processed, %d directories queued",
+                     observed, processed, len(queue))
             last_progress = now
 
     while queue:
@@ -134,8 +134,8 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
         db.execute("UPDATE runs SET scan_status=?,scan_ended_at=? WHERE id=?",
                    ("complete" if complete else "incomplete", utcnow(), run))
         _schedule_transfers(state, run)
-    LOG.info("Discovery %s: %d entries examined, %d directories processed",
-             "complete" if complete else "incomplete", observed, processed)
+    LOG.info("Discovery %s: %d entries examined, %d directories processed, %d directories queued",
+             "complete" if complete else "incomplete", observed, processed, len(queue))
     return complete
 
 

@@ -116,6 +116,11 @@ def write_reports(state, run, scan_run=None, backup_run=None):
     unresolved = [e for e in errors if e["resolved_at"] is None]
     write_csv("unresolved", error_fields, unresolved)
     observations = db.execute("SELECT * FROM observations WHERE run_id=? AND selected=1", (scan_run,)).fetchall() if scan_run else []
+    # Count the scan's observations, not paths retained from earlier runs.
+    # The configured root is not a discovered entry and is excluded.
+    directories_discovered = db.execute(
+        "SELECT COUNT(*) FROM observations WHERE run_id=? AND kind='directory'", (scan_run,)
+    ).fetchone()[0]
     active = {t["path_id"]: t for t in db.execute("SELECT * FROM transfers WHERE state IN ('pending','failed','ready','downloading')")}
     gaps, covered, unchanged = [], 0, 0
     for p in observations:
@@ -148,6 +153,7 @@ def write_reports(state, run, scan_run=None, backup_run=None):
         "remote_root": cfg.remote_root, "destination": str(cfg.export), "host_key_fingerprint": source["host_key_fingerprint"],
         "scan_run": scan_run, "scan_status": scan["scan_status"] if scan else "not_started", "scan_complete": scan_complete,
         "scan_started_at": scan["scan_started_at"] if scan else None, "scan_ended_at": scan["scan_ended_at"] if scan else None,
+        "directories_discovered": directories_discovered,
         "pdfs_discovered": len(observations), "bytes_discovered": sum(p["size"] or 0 for p in observations),
         "pdfs_with_unknown_size": sum(p["size"] is None for p in observations), "unchanged_skips": unchanged,
         "new_successes": len(completed) - changed, "changed_or_repeated_successes": changed,
