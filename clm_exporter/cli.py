@@ -85,7 +85,8 @@ def execute(cfg, command, force_path=None, report_run=None, remote_factory=Remot
                     if command == "download":
                         transfers.remote = remote
                         transfers.download(force_path)
-                LOG.info("Command finished: %s", command)
+                if command != "init":
+                    LOG.info("Command finished: %s", command)
             except CapacityStop as exc:
                 reason = exc.reason
                 LOG.info("Planned stop: %s", reason)
@@ -137,7 +138,13 @@ def main(argv=None):
         cfg = load(args.config)
         code, summary = execute(cfg, args.command, getattr(args, "force_path", None), getattr(args, "run_id", None),
                                 progress=not args.no_progress)
-        print(json.dumps(summary, indent=2))
+        if args.command == "init":
+            if code == 0:
+                print("Initialized.")
+            else:
+                print("Initialization interrupted." if code == 130 else "Initialization failed.", file=sys.stderr)
+        else:
+            print(json.dumps(summary, indent=2))
         return code
     except KeyboardInterrupt:
         return 130
