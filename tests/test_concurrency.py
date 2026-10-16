@@ -81,6 +81,10 @@ class Sessions:
                 else:
                     yield from super().iterdir(relative)
 
+            def check_directory(self, relative):
+                self.check()
+                return super().check_directory(relative)
+
             def open(self, relative):
                 self.check()
                 if owner.source.open_hook:
@@ -173,6 +177,164 @@ class ConcurrentTests(unittest.TestCase):
         before = self.rows("SELECT remote,local FROM paths ORDER BY remote")
         self.assertEqual(self.invoke("inventory")[0], 0)
         self.assertEqual(before, self.rows("SELECT remote,local FROM paths ORDER BY remote"))
+
+    def test_missing_metadata_checks_overlap_within_one_folder(self):
+        self.cfg = replace(self.cfg, workers=3)
+        for name in ("a.pdf", "b.pdf", "c.pdf"):
+            self.sessions.source.add(name)
+            self.sessions.source.list_missing_attrs.add(name)
+        checks = threading.Barrier(3, timeout=5)
+        self.sessions.source.stat_hook = lambda path: checks.wait() if path.endswith(".pdf") else None
+
+        code, summary = self.invoke("inventory")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(summary["pdfs_discovered"], 3)
+        self.assertEqual(summary["scan_status"], "complete")
+        self.assertEqual(self.sessions.peak, 3)
+        self.assertEqual(self.sessions.source.opens, [])
+
+    def test_ambiguous_directory_probes_overlap_within_one_folder(self):
+        self.cfg = replace(self.cfg, workers=3)
+        for directory in ("a", "b", "c"):
+            self.sessions.source.add(directory, kind="directory")
+            self.sessions.source.reported_modes[directory] = 0o140750
+        probes = threading.Barrier(3, timeout=5)
+        original = FakeRemote.check_directory
+
+        def probe(client, relative):
+            probes.wait()
+            return original(client, relative)
+
+        with patch.object(FakeRemote, "check_directory", probe):
+            code, summary = self.invoke("inventory")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(summary["directories_discovered"], 3)
+        self.assertEqual(summary["scan_status"], "complete")
+        self.assertEqual(self.sessions.peak, 3)
+
+    def test_child_finishes_before_parent_listing_without_changing_aliases(self):
+        for directory in ("A", "a", "a-1"):
+            for name in ("B.pdf", "b.pdf", "b-1.pdf"):
+                self.sessions.source.add(f"{directory}/{name}")
+        child_finished = threading.Event()
+
+        def listing(client, relative):
+            entries = list(FakeRemote.iterdir(client, relative))
+            if not relative:
+                yield next(entry for entry in entries if entry.filename == "a")
+                self.assertTrue(child_finished.wait(5), "Child scan waited for its parent listing")
+                yield from (entry for entry in entries if entry.filename != "a")
+            else:
+                yield from entries
+                if relative == "a":
+                    child_finished.set()
+
+        self.sessions.listing = listing
+        self.assertEqual(self.invoke()[0], 0)
+        parallel = self.rows("SELECT remote,local FROM paths ORDER BY remote")
+        self.assertEqual(dict(parallel)["a/b.pdf"], "a-2/b-2.pdf")
+        self.assertEqual((self.cfg.export / "a-2/b-2.pdf").read_bytes(), b"pdf")
+
+        self.cfg = replace(self.cfg, workers=1, working_directory=self.root / "sequential")
+        self.sessions.listing = None
+        # Each invocation audits its own connection ceiling.
+        self.sessions.peak = 0
+        self.invoke("init")
+        with redirect_stderr(io.StringIO()):
+            code, _ = execute(self.cfg, "inventory", remote_factory=self.sessions.source.factory, progress=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(parallel, self.rows("SELECT remote,local FROM paths ORDER BY remote"))
+
+    def test_listing_retry_settles_entry_checks_before_repeating(self):
+        self.sessions.source.add("a.pdf")
+        self.sessions.source.list_missing_attrs.add("a.pdf")
+        inspection_started = threading.Event()
+        listing_failed = threading.Event()
+        release_inspection = threading.Event()
+        attempts = 0
+
+        def listing(client, directory):
+            nonlocal attempts
+            attempts += 1
+            yield from FakeRemote.iterdir(client, directory)
+            if attempts == 1:
+                self.assertTrue(inspection_started.wait(5))
+                listing_failed.set()
+                raise ConnectionError("partial listing")
+
+        def stat(relative):
+            if relative == "a.pdf" and attempts == 1:
+                inspection_started.set()
+                self.assertTrue(listing_failed.wait(5))
+                self.assertTrue(release_inspection.wait(5))
+                raise TimeoutError("transient metadata failure")
+
+        original = Workers.receive
+
+        def receive(pool, handler):
+            event = original(pool, handler)
+            if isinstance(event.error, ConnectionError):
+                release_inspection.set()
+            return event
+
+        self.sessions.listing = listing
+        self.sessions.source.stat_hook = stat
+        with patch.object(Workers, "receive", receive):
+            code, summary = self.invoke("inventory")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(summary["scan_status"], "complete")
+        self.assertEqual(self.rows("SELECT * FROM errors WHERE resolved_at IS NULL"), [])
+        self.assertEqual(len(self.rows("SELECT * FROM observations")), 1)
+
+    def test_parallel_entry_failure_preserves_healthy_observations(self):
+        self.cfg = replace(self.cfg, workers=3)
+        for name in ("a.pdf", "b.pdf", "c.pdf"):
+            self.sessions.source.add(name)
+            self.sessions.source.list_missing_attrs.add(name)
+        self.sessions.source.denied.add("a.pdf")
+        checks = threading.Barrier(3, timeout=5)
+        self.sessions.source.stat_hook = lambda path: checks.wait() if path.endswith(".pdf") else None
+
+        code, summary = self.invoke("inventory")
+
+        self.assertEqual((code, summary["scan_status"]), (2, "incomplete"))
+        self.assertEqual(self.rows("SELECT remote,size FROM paths ORDER BY remote"),
+                         [("a.pdf", None), ("b.pdf", 3), ("c.pdf", 3)])
+        self.assertEqual(self.rows("SELECT remote,operation,category FROM errors WHERE resolved_at IS NULL"),
+                         [("a.pdf", "metadata", "permission_denied")])
+        self.sessions.source.stat_hook = None
+        self.sessions.source.denied.clear()
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual(self.rows("SELECT * FROM errors WHERE resolved_at IS NULL"), [])
+
+    def test_interrupt_with_entry_checks_in_flight_can_restart(self):
+        self.cfg = replace(self.cfg, workers=3)
+        for name in ("a.pdf", "b.pdf", "c.pdf"):
+            self.sessions.source.add(name)
+            self.sessions.source.list_missing_attrs.add(name)
+        checks = threading.Barrier(3, timeout=5)
+        self.sessions.source.stat_hook = lambda path: checks.wait() if path.endswith(".pdf") else None
+        original = Workers.receive
+
+        def interrupt(pool, handler):
+            original(pool, handler)
+            raise KeyboardInterrupt
+
+        with patch.object(Workers, "receive", interrupt):
+            code, summary = self.invoke("inventory")
+
+        self.assertEqual(code, 130)
+        self.assertEqual(summary["scan_status"], "incomplete")
+        self.assertTrue(Path(summary["reports"]["backup"]).exists())
+        self.sessions.source.stat_hook = None
+        code, summary = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertTrue(summary["local_download_complete"])
+        self.assertEqual(summary["new_successes"], 3)
 
     def test_successful_listing_retry_clears_transient_entry_failure(self):
         self.sessions.source.add("a.pdf")
@@ -353,10 +515,10 @@ class ConcurrentTests(unittest.TestCase):
             self.cfg = replace(self.cfg, working_directory=self.root / slow / "export")
             self.invoke("init")
             finished = threading.Event()
-            def enumerate_in_order(remote, directory, attempt, emit, slow=slow, fast=fast, finished=finished):
+            def enumerate_in_order(remote, directory, attempt, emit, slow=slow, fast=fast, finished=finished, **kwargs):
                 if directory == slow:
                     self.assertTrue(finished.wait(5))
-                original(remote, directory, attempt, emit)
+                original(remote, directory, attempt, emit, **kwargs)
                 if directory == fast:
                     finished.set()
             with patch.object(discovery, "enumerate_directory", enumerate_in_order):

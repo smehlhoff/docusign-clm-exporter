@@ -33,6 +33,19 @@ Set your SFTP host, username, RSA key, trusted `known_hosts` file, and remote ro
 in the config. Verify and add the server host key before connecting. Encrypted RSA
 keys prompt for a passphrase.
 
+For concurrent scanning and downloads, set the connection limit in your config:
+
+```toml
+[concurrency]
+workers = 3
+```
+
+The default is one worker. With multiple workers, entry metadata and directory
+checks can use idle connections, and confirmed child folders can start scanning
+before their parent listing finishes. Filename mappings are assigned after
+discovery in a stable order. Downloads then use the same worker limit to transfer
+separate PDFs concurrently. Restart the command after changing this setting.
+
 Relative paths resolve from the config file's folder. The default
 `working_directory = "./export"` creates downloads, state, and reports under
 `export/`. Both `config.toml` and `export/` are ignored by Git.
