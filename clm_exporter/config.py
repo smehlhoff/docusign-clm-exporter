@@ -25,6 +25,7 @@ class Config:
     read_timeout_seconds: int = 60
     keepalive_seconds: int = 30
     chunk_bytes: int = 1_048_576
+    workers: int = 1
 
     def __post_init__(self) -> None:
         # Canonicalize ancestors (e.g. macOS /var -> /private/var) while leaving
@@ -77,6 +78,7 @@ def load(path: str | os.PathLike[str]) -> Config:
 def _parse_values(raw: dict[str, Any], path: Path) -> dict[str, Any]:
     """Flatten known sections and normalize paths without resolving symlinks."""
     allowed = {
+        "concurrency": {"workers"},
         "sftp": {"host", "port", "username", "private_key_path", "known_hosts_path", "remote_root"},
         "local": {"working_directory", "export_folder_name"},
         "limits": {"max_staged_bytes", "min_free_bytes"},
@@ -108,7 +110,7 @@ def _validate_config(cfg: Config) -> None:
             or name.casefold() in {"work", "state", "reports", "config.toml"}):
         raise ValueError("export_folder_name must be a dedicated single directory name")
     for key in ("port", "max_staged_bytes", "min_free_bytes", "max_attempts",
-                "connect_timeout_seconds", "read_timeout_seconds", "keepalive_seconds", "chunk_bytes"):
+                "connect_timeout_seconds", "read_timeout_seconds", "keepalive_seconds", "chunk_bytes", "workers"):
         value = getattr(cfg, key)
         if type(value) is not int or value < (0 if key == "min_free_bytes" else 1):
             raise ValueError(f"{key} must be a {'nonnegative' if key == 'min_free_bytes' else 'positive'} integer")

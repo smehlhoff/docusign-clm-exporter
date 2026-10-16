@@ -1,4 +1,4 @@
-"""One active transfer, with durable ready records spanning atomic promotion."""
+"""Serial transfers and shared durable state transitions for both schedulers."""
 import errno
 import hashlib
 import logging
@@ -145,12 +145,7 @@ class Transfers:
         # before scheduling content; subsequent writes update it chunk by chunk.
         self.capacity.staged = footprint(self.cfg)
         if force_path is not None:
-            path = self.db.execute("SELECT * FROM paths WHERE remote=? AND last_seen_run=? AND selected=1", (force_path, self.run)).fetchone()
-            if path is None or path["size"] is None or path["mtime"] is None:
-                self.state.error(self.run, force_path, "force", "source_unavailable", "Forced path is not a current PDF with complete metadata")
-            else:
-                with self.state.transaction():
-                    self.state.job(path, self.run, forced=True)
+            self._queue_forced_path(force_path)
         paths = self.db.execute("""SELECT p.* FROM paths p JOIN transfers t ON t.path_id=p.id
             WHERE p.last_seen_run=? AND p.selected=1 AND p.local IS NOT NULL
               AND p.size IS NOT NULL AND p.mtime IS NOT NULL AND t.state IN ('pending','failed')
@@ -162,6 +157,71 @@ class Transfers:
                 # Successful completion remains a separate durable database fact.
                 bar.update(1)
 
+    def _queue_forced_path(self, force_path: str) -> None:
+        """Queue an explicit repeat or record why the current scan cannot supply it."""
+        path = self.db.execute(
+            "SELECT * FROM paths WHERE remote=? AND last_seen_run=? AND selected=1",
+            (force_path, self.run),
+        ).fetchone()
+        if path is None or path["size"] is None or path["mtime"] is None:
+            self.state.error(
+                self.run, force_path, "force", "source_unavailable",
+                "Forced path is not a current PDF with complete metadata",
+            )
+        else:
+            with self.state.transaction():
+                self.state.job(path, self.run, forced=True)
+
+    def _refresh_job(
+        self, path: Row, job: Row, attempt: int, size: int, mtime: str
+    ) -> tuple[Row, int | None]:
+        """Persist metadata and return (path, job_id); a None job ID skips work.
+
+        Reverting to a downloaded version supersedes ordinary pending work,
+        but a forced repeat remains pending until it succeeds.
+        """
+        with self.state.transaction():
+            self.db.execute("UPDATE paths SET size=?,mtime=? WHERE id=?", (size, mtime, path["id"]))
+            self.db.execute(
+                "UPDATE observations SET size=?,mtime=? WHERE run_id=? AND path_id=?",
+                (size, mtime, self.run, path["id"]),
+            )
+            path = self.db.execute("SELECT * FROM paths WHERE id=?", (path["id"],)).fetchone()
+            latest = self.state.latest(path["id"])
+            if not job["forced"] and latest and (latest["size"], latest["mtime"]) == (size, mtime):
+                self.db.execute("UPDATE transfers SET state='superseded' WHERE id=?", (job["id"],))
+                self.state.resolve(self.run, path["remote"], ["transfer", "availability"])
+                return path, None
+            job_id = self.state.job(path, self.run, forced=job["forced"])
+            self.db.execute(
+                "UPDATE transfers SET attempts=?,attempt_run=? WHERE id=?",
+                (attempt, self.run, job_id),
+            )
+        return path, job_id
+
+    def _reject_oversized_file(self, path: Row, job_id: int, size: int, attempt: int) -> bool:
+        """Record a file that can never fit in a batch, allowing others to proceed."""
+        if size <= self.cfg.max_staged_bytes:
+            return False
+        self.state.error(
+            self.run, path["remote"], "transfer", "file_exceeds_batch_limit",
+            f"File has {size} bytes; batch limit is {self.cfg.max_staged_bytes}", attempt,
+        )
+        with self.state.transaction():
+            self.db.execute(
+                "UPDATE transfers SET state='failed',last_error='file_exceeds_batch_limit' WHERE id=?",
+                (job_id,),
+            )
+        return True
+
+    def _validate_target(self, path: Row) -> None:
+        """Create safe parent directories and verify ownership of an existing target."""
+        target = safe_target(self.cfg.export, path["local"], create_parents=True)
+        if target.exists():
+            latest = self.state.latest(path["id"])
+            if latest is None or digest_file(target) != (latest["size"], latest["sha256"]):
+                raise PathError(f"Refusing untracked or modified local target: {path['local']}")
+
     def download_file(self, path: Row) -> None:
         """Retry a pending file while retaining any durable ready payload."""
         job = self.db.execute("SELECT * FROM transfers WHERE path_id=? AND state IN ('pending','failed')", (path["id"],)).fetchone()
@@ -170,30 +230,13 @@ class Transfers:
                 with self.state.transaction():
                     self.db.execute("UPDATE transfers SET attempts=?,attempt_run=? WHERE id=?", (attempt, self.run, job["id"]))
                 size, mtime = file_metadata(self.remote.lstat(path["remote"]))
-                with self.state.transaction():
-                    self.db.execute("UPDATE paths SET size=?,mtime=? WHERE id=?", (size, mtime, path["id"]))
-                    self.db.execute("UPDATE observations SET size=?,mtime=? WHERE run_id=? AND path_id=?",
-                                    (size, mtime, self.run, path["id"]))
-                    path = self.db.execute("SELECT * FROM paths WHERE id=?", (path["id"],)).fetchone()
-                    latest = self.state.latest(path["id"])
-                    if not job["forced"] and latest and (latest["size"], latest["mtime"]) == (size, mtime):
-                        self.db.execute("UPDATE transfers SET state='superseded' WHERE id=?", (job["id"],))
-                        self.state.resolve(self.run, path["remote"], ["transfer", "availability"])
-                        return
-                    job_id = self.state.job(path, self.run, forced=job["forced"])
-                    self.db.execute("UPDATE transfers SET attempts=?,attempt_run=? WHERE id=?", (attempt, self.run, job_id))
-                job = self.get_job(job_id)
-                if size > self.cfg.max_staged_bytes:
-                    self.state.error(self.run, path["remote"], "transfer", "file_exceeds_batch_limit",
-                                     f"File has {size} bytes; batch limit is {self.cfg.max_staged_bytes}", attempt)
-                    with self.state.transaction():
-                        self.db.execute("UPDATE transfers SET state='failed',last_error='file_exceeds_batch_limit' WHERE id=?", (job_id,))
+                path, job_id = self._refresh_job(path, job, attempt, size, mtime)
+                if job_id is None:
                     return
-                target = safe_target(self.cfg.export, path["local"], create_parents=True)
-                if target.exists():
-                    latest = self.state.latest(path["id"])
-                    if latest is None or digest_file(target) != (latest["size"], latest["sha256"]):
-                        raise PathError(f"Refusing untracked or modified local target: {path['local']}")
+                job = self.get_job(job_id)
+                if self._reject_oversized_file(path, job_id, size, attempt):
+                    return
+                self._validate_target(path)
                 self.capacity.check(size)
                 temp_name = f"transfer-{job_id}-{uuid.uuid4().hex}.part"
                 with self.state.transaction():

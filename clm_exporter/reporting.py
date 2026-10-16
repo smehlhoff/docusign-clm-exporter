@@ -195,7 +195,7 @@ def _download_gaps(
         matches = success and (success["size"], success["mtime"]) == (
             observation["size"], observation["mtime"]
         )
-        if matches:
+        if success is not None and matches:
             covered += 1
             unchanged += success["completion_run"] != run
         if not matches or path_id in active:

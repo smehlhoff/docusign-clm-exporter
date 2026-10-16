@@ -77,10 +77,21 @@ def execute(cfg, command, force_path=None, report_run=None, remote_factory=Remot
                     options = {"free": free, "checkpoint": checkpoint, "progress": display}
                     if sleep:
                         options["sleep"] = sleep
-                    transfers = Transfers(state, run, **options)
-                    transfers.recover()
-                    remote = remote_factory(cfg, state)
-                    remote.connect()
+                    if cfg.workers > 1:
+                        from .parallel_transfer import ParallelTransfers
+                        from .workers import Workers
+                        transfers = ParallelTransfers(state, run, **options)
+                        transfers.recover()
+                        remote = Workers(cfg, state, remote_factory)
+                    else:
+                        transfers = Transfers(state, run, **options)
+                        transfers.recover()
+                        remote = remote_factory(cfg, state)
+                        fingerprint = remote.connect()
+                        if fingerprint:
+                            with state.transaction():
+                                state.db.execute("UPDATE source SET host_key_fingerprint=? WHERE id=1", (fingerprint,))
+                    LOG.info("Discovery configured workers=%d", cfg.workers)
                     scan(state, remote, run, progress=display, **({"sleep": sleep} if sleep else {}))
                     if command == "download":
                         transfers.remote = remote

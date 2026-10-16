@@ -23,6 +23,11 @@ remote_root = "//root/child/../"
 working_directory = "./export"
 '''
 
+    def test_example_uses_documented_capacity_defaults(self):
+        cfg = load(Path(__file__).parents[1] / "config.example.toml")
+        self.assertEqual(cfg.max_staged_bytes, 350_000_000_000)
+        self.assertEqual(cfg.min_free_bytes, 50_000_000_000)
+
     def test_relative_paths_and_remote_root_normalization(self):
         self.path.write_text(self.valid)
         cfg = load(str(self.path))
@@ -42,6 +47,8 @@ working_directory = "./export"
         cases = [
             (self.valid + '\n[extra]\n', "Unknown configuration option in [extra]"),
             (self.valid + '\n[transfer]\nworkers = 2\n', "Unknown configuration option in [transfer]"),
+            (self.valid + '\n[concurrency]\npassphrase = "secret"\n',
+             "Unknown configuration option in [concurrency]"),
             ('sftp = "invalid"\n', "Unknown configuration option in [sftp]"),
             (self.valid.replace('"//root/child/../"', '"relative"').replace(
                 '"SFTP.example"', '""'), "remote_root must be an absolute POSIX path"),
@@ -59,10 +66,11 @@ working_directory = "./export"
                 self.assertIsInstance(raised.exception.__cause__, ValueError)
 
     def test_integer_limits_reject_booleans_and_accept_boundary_values(self):
-        for value in ("true", "1.5", "0", "-1"):
-            with self.subTest(value=value):
-                self.path.write_text(self.valid + f'\n[transfer]\nmax_attempts = {value}\n')
-                with self.assertRaisesRegex(FatalError, "max_attempts must be a positive integer"):
+        for key, value in (("max_attempts", "true"), ("max_attempts", "1.5"),
+                           ("max_attempts", "0"), ("max_attempts", "-1"), ("chunk_bytes", "0")):
+            with self.subTest(key=key, value=value):
+                self.path.write_text(self.valid + f'\n[transfer]\n{key} = {value}\n')
+                with self.assertRaisesRegex(FatalError, f"{key} must be a positive integer"):
                     load(self.path)
         self.path.write_text(self.valid.replace('username =', 'port = 65535\nusername =')
                              + '\n[limits]\nmin_free_bytes = 0\n[transfer]\nchunk_bytes = 16777216\n')
@@ -80,3 +88,15 @@ working_directory = "./export"
         with self.assertRaises(FatalError) as raised:
             load(self.path)
         self.assertIsInstance(raised.exception.__cause__, FileNotFoundError)
+
+    def test_worker_count_defaults_and_validation(self):
+        self.path.write_text(self.valid)
+        self.assertEqual(load(self.path).workers, 1)
+        for value in (1, 2, 5, 1000):
+            self.path.write_text(self.valid + f"\n[concurrency]\nworkers = {value}\n")
+            self.assertEqual(load(self.path).workers, value)
+        for value in ('true', 'false', '0', '-1', '1.5', '"2"'):
+            with self.subTest(value=value):
+                self.path.write_text(self.valid + f"\n[concurrency]\nworkers = {value}\n")
+                with self.assertRaisesRegex(FatalError, "workers must be a positive integer"):
+                    load(self.path)

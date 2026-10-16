@@ -46,5 +46,5 @@ def allocate_siblings(state, run, parent):
                 state.resolve(run, row["remote"], ["mapping"])
             except (OSError, PathError) as exc:
                 failures.append((row["remote"], exc))
-    for remote, exc in failures:
-        state.error(run, remote, "mapping", "unrepresentable_path", exc)
+    for remote, failure in failures:
+        state.error(run, remote, "mapping", "unrepresentable_path", failure)

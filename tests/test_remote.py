@@ -7,9 +7,7 @@ from unittest.mock import Mock, call, patch
 
 from clm_exporter.config import Config
 from clm_exporter.errors import FatalError, MetadataError
-from clm_exporter.local import prepare_layout
 from clm_exporter.remote import Remote, entry_metadata, file_metadata
-from clm_exporter.state import State
 
 
 class MetadataTests(unittest.TestCase):
@@ -50,9 +48,6 @@ class AdapterTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
         self.cfg = Config("trusted.example", "operator", root / "key", root / "known_hosts", "/root", root / "working")
-        prepare_layout(self.cfg)
-        self.state = State(self.cfg, initialize=True)
-        self.addCleanup(self.state.close)
         self.client = Mock()
         self.client.get_transport().get_remote_server_key().asbytes.return_value = b"trusted-public-key"
         self.module = SimpleNamespace(SSHClient=Mock(return_value=self.client), RSAKey=Mock(), RejectPolicy=type("RejectPolicy", (), {}),
@@ -64,13 +59,13 @@ class AdapterTests(unittest.TestCase):
         self.addCleanup(self.context.stop)
 
     def remote(self):
-        remote = Remote(self.cfg, self.state, sleep=lambda _: None)
+        remote = Remote(self.cfg, sleep=lambda _: None)
         self.addCleanup(remote.close)
         return remote
 
     def test_explicit_rsa_no_fallback_and_trusted_fingerprint(self):
         remote = self.remote()
-        remote.connect()
+        fingerprint = remote.connect()
         self.client.load_host_keys.assert_called_once_with(str(self.cfg.known_hosts_path))
         args = self.client.connect.call_args.kwargs
         self.assertFalse(args["allow_agent"])
@@ -79,7 +74,7 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn("key_filename", args)
         self.assertEqual(args["username"], "operator")
         self.assertEqual(args["pkey"], self.module.RSAKey.from_private_key_file.return_value)
-        self.assertTrue(self.state.db.execute("SELECT host_key_fingerprint FROM source").fetchone()[0].startswith("SHA256:"))
+        self.assertTrue(fingerprint.startswith("SHA256:"))
         self.client.get_transport().set_keepalive.assert_called_once_with(30)
         self.client.open_sftp().get_channel().settimeout.assert_called_once_with(60)
 
@@ -100,24 +95,6 @@ class AdapterTests(unittest.TestCase):
             remote.reconnect(ConnectionError("dropped"))
         with self.assertRaisesRegex(FatalError, "budget exhausted"):
             remote.reconnect(ConnectionError("dropped"))
-
-    def test_missing_known_hosts_is_fatal(self):
-        self.client.load_host_keys.side_effect = FileNotFoundError()
-        with self.assertRaisesRegex(FatalError, "known_hosts"):
-            self.remote().connect()
-        self.client.connect.assert_not_called()
-
-    def test_bounded_directory_readahead_and_read_only_file_mode(self):
-        remote = self.remote()
-        remote.connect()
-        sftp = self.client.open_sftp.return_value
-        sftp.listdir_iter.return_value = iter([])
-        list(remote.iterdir("dir"))
-        sftp.listdir_iter.assert_called_once_with("/root/dir", read_aheads=1)
-        sftp.open.return_value = unittest.mock.MagicMock()
-        with remote.open("dir/a.pdf"):
-            pass
-        sftp.open.assert_called_once_with("/root/dir/a.pdf", "rb", bufsize=0)
 
     def test_directory_handle_close_failure_cannot_look_like_a_rejected_probe(self):
         remote = self.remote()

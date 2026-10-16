@@ -40,7 +40,6 @@ Relative paths resolve from the config file's folder. The default
 Keep the working directory outside synced folders. Configurable defaults allow
 **350 GB** of staged files, including temporary downloads, and reserve **50 GB** of
 free disk space (decimal GB).
-Scanning and downloading are sequential; a `workers` setting is not implemented.
 
 Initialize once, then download:
 
@@ -118,4 +117,5 @@ Optional synthetic pilot:
 
 ```bash
 uv run --python 3.12 python -m tests.synthetic_pilot --output /tmp/clm-pilot.json
+uv run --python 3.12 python -m tests.concurrency_pilot
 ```

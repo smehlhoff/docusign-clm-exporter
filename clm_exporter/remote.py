@@ -7,6 +7,7 @@ import math
 import posixpath
 import random
 import stat
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -59,15 +60,19 @@ def backoff(attempt):
 
 
 class Remote:
-    def __init__(self, cfg, state, sleep=backoff):
+    def __init__(self, cfg, state=None, sleep=backoff, *, key=None, retry=None):
         try:
             import paramiko
         except ImportError as exc:
             raise FatalError("Paramiko is missing; install requirements.txt in your virtual environment") from exc
         self.p = paramiko
-        self.cfg, self.state, self.sleep = cfg, state, sleep
+        self.cfg, self.sleep = cfg, sleep
         self.client = self.sftp = None
         self.reconnections = 0
+        self.retry = retry
+        if key is not None:
+            self.key = key
+            return
         try:
             try:
                 self.key = paramiko.RSAKey.from_private_key_file(str(cfg.private_key_path))
@@ -112,9 +117,7 @@ class Remote:
                 self.sftp.get_channel().settimeout(cfg.read_timeout_seconds)
                 key = transport.get_remote_server_key()
                 fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
-                with self.state.transaction():
-                    self.state.db.execute("UPDATE source SET host_key_fingerprint=? WHERE id=1", (fingerprint,))
-                return
+                return fingerprint
             except (p.AuthenticationException, p.BadHostKeyException) as exc:
                 self.close()
                 raise FatalError(f"SSH authentication or host-key verification failed: {exc}") from exc
@@ -122,6 +125,8 @@ class Remote:
                 self.close()
                 if attempt == cfg.max_attempts:
                     raise FatalError(f"SFTP connection failed after {attempt} attempts: {exc}") from exc
+                if self.retry is not None:
+                    self.retry(exc)
                 self.sleep(attempt)
             except BaseException:
                 self.close()
@@ -168,13 +173,51 @@ class Remote:
     def lstat(self, relative):
         try:
             return self.sftp.lstat(self.absolute(relative))
+        except UnicodeError as exc:
+            raise MetadataError("SFTP metadata response contains text that is not valid UTF-8") from exc
         except self.p.SSHException as exc:
             raise ConnectionError(str(exc)) from exc
 
     def iterdir(self, relative):
-        # Bound READDIR pipelining; no file prefetch or unbounded read-ahead.
+        from paramiko.sftp import (
+            CMD_CLOSE,
+            CMD_HANDLE,
+            CMD_NAME,
+            CMD_OPENDIR,
+            CMD_READDIR,
+        )
+
+        # Paramiko's listdir_iter closes its handle only at EOF. Own the handle
+        # here so decode failures, READDIR failures and early exits also close it.
+        # One synchronous READDIR at a time keeps listing memory bounded.
+        sftp = self.sftp
         try:
-            yield from self.sftp.listdir_iter(self.absolute(relative), read_aheads=1)
+            response, message = sftp._request(CMD_OPENDIR, self.absolute(relative))
+            if response != CMD_HANDLE:
+                raise MetadataError("Directory listing did not return an SFTP handle")
+            handle = message.get_string()
+            try:
+                while True:
+                    try:
+                        response, message = sftp._request(CMD_READDIR, handle)
+                    except EOFError:
+                        return
+                    if response != CMD_NAME:
+                        raise MetadataError("Directory listing did not return SFTP names")
+                    for _ in range(message.get_int()):
+                        name, longname = message.get_text(), message.get_text()
+                        attrs = self.p.SFTPAttributes._from_msg(message, name, longname)
+                        if name not in (".", ".."):
+                            yield attrs
+            finally:
+                error = sys.exception()
+                try:
+                    sftp._request(CMD_CLOSE, handle)
+                except (OSError, EOFError, UnicodeError, self.p.SSHException) as exc:
+                    # A failed CLOSE requires reconnection, but must never
+                    # replace cancellation or a process interrupt.
+                    if error is None or isinstance(error, Exception):
+                        raise ConnectionError("Could not close directory listing handle") from exc
         except UnicodeError as exc:
             raise MetadataError("Directory listing contains text that is not valid UTF-8") from exc
         except self.p.SSHException as exc:
@@ -192,18 +235,32 @@ class Remote:
                 raise MetadataError("Directory check did not return an SFTP handle")
             try:
                 self.sftp._request(CMD_CLOSE, message.get_string())
-            except OSError as exc:
+            except (OSError, UnicodeError) as exc:
                 # OPENDIR already confirmed a directory. Reconnect to release
                 # its handle; this is not a negative directory-probe response.
                 raise ConnectionError("Could not close confirmed directory handle") from exc
+        except UnicodeError as exc:
+            raise MetadataError("SFTP directory response contains text that is not valid UTF-8") from exc
         except self.p.SSHException as exc:
             raise ConnectionError(str(exc)) from exc
 
     @contextmanager
     def open(self, relative):
         try:
-            with self.sftp.open(self.absolute(relative), "rb", bufsize=0) as stream:
+            stream = self.sftp.open(self.absolute(relative), "rb", bufsize=0)
+            try:
                 yield stream
+            finally:
+                error = sys.exception()
+                try:
+                    stream.close()
+                except (OSError, EOFError, UnicodeError, self.p.SSHException) as exc:
+                    # An unacknowledged close requires a fresh session, but
+                    # cleanup must preserve an interrupt from the caller.
+                    if error is None or isinstance(error, Exception):
+                        raise ConnectionError("Could not close remote file handle") from exc
+        except UnicodeError as exc:
+            raise MetadataError("SFTP file response contains text that is not valid UTF-8") from exc
         except self.p.SSHException as exc:
             raise ConnectionError(str(exc)) from exc
 

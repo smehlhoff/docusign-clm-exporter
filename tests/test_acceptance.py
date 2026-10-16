@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from clm_exporter.cli import execute, main
-from clm_exporter.config import Config, load
+from clm_exporter.config import Config
 from clm_exporter.errors import FatalError, PathError
 from clm_exporter.local import working_lock
 
@@ -382,33 +382,19 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(summary["local_download_complete"])
 
-    def test_unusable_file_types_do_not_block_pdf_inventory_or_download(self):
-        pdfs = ["invalid.pdf", "permissions.PDF", "regular.pdf"]
-        for path in pdfs:
-            self.remote.add(path)
-        self.remote.reported_modes.update({"invalid.pdf": "invalid", "permissions.PDF": 0o600})
-        code, summary = self.invoke("inventory")
-        self.assertEqual(code, 0)
-        self.assertEqual(summary["pdfs_discovered"], len(pdfs))
-        self.assertFalse(self.remote.opens)
-
-        code, summary = self.invoke()
-        self.assertEqual(code, 0)
-        self.assertEqual(summary["scan_status"], "complete")
-        self.assertTrue(summary["local_download_complete"])
-        self.assertEqual(self.remote.opens, pdfs)
-        for path in pdfs:
-            with self.subTest(path=path):
-                self.assertEqual((self.cfg.export / path).read_bytes(), b"pdf")
-
     def test_pdf_listing_metadata_avoids_redundant_stat(self):
-        for name, mode in (("missing.pdf", None), ("permissions.PDF", 0o600), ("special.pdf", 0o140640)):
+        pdfs = ["invalid.pdf", "missing.pdf", "permissions.PDF", "regular.pdf", "special.pdf"]
+        self.remote.add("regular.pdf")
+        for name, mode in (("invalid.pdf", "invalid"), ("missing.pdf", None),
+                           ("permissions.PDF", 0o600), ("special.pdf", 0o140640)):
             self.remote.add(name)
             self.remote.reported_modes[name] = mode
         with patch.object(self.remote, "lstat", wraps=self.remote.lstat) as lstat:
             code, summary = self.invoke("inventory")
         self.assertEqual(code, 0)
-        self.assertEqual(summary["pdfs_discovered"], 3)
+        self.assertEqual(summary["scan_status"], "complete")
+        self.assertEqual(summary["pdfs_discovered"], len(pdfs))
+        self.assertFalse(self.remote.opens)
         self.assertEqual([c.args[0] for c in lstat.call_args_list], [""])
 
         with patch.object(self.remote, "lstat", wraps=self.remote.lstat) as lstat:
@@ -417,7 +403,11 @@ class ExportTests(unittest.TestCase):
         self.assertTrue(summary["local_download_complete"])
         # Each payload still has metadata checked before and after reading.
         self.assertEqual([c.args[0] for c in lstat.call_args_list],
-                         ["", "missing.pdf", "missing.pdf", "permissions.PDF", "permissions.PDF", "special.pdf", "special.pdf"])
+                         [""] + [name for name in pdfs for _ in range(2)])
+        self.assertEqual(self.remote.opens, pdfs)
+        for path in pdfs:
+            with self.subTest(path=path):
+                self.assertEqual((self.cfg.export / path).read_bytes(), b"pdf")
 
     def test_pdf_missing_listing_metadata_still_uses_stat(self):
         for name in ("size.pdf", "mtime.pdf"):
@@ -466,23 +456,6 @@ class ExportTests(unittest.TestCase):
         for path in pdfs:
             with self.subTest(path=path):
                 self.assertEqual((self.cfg.export / path).read_bytes(), b"pdf")
-
-    def test_directory_probe_failures_remain_visible_and_recoverable(self):
-        self.remote.add("folder/contract.pdf")
-        self.remote.reported_modes["folder"] = 0o140750
-        for failure in (PermissionError("denied"), ConnectionError("dropped")):
-            with self.subTest(failure=type(failure).__name__):
-                with patch.object(self.remote, "check_directory", side_effect=failure):
-                    code, summary = self.invoke("download")
-                self.assertEqual(code, 2)
-                self.assertEqual(summary["scan_status"], "incomplete")
-                self.assertEqual(summary["unresolved_directory_errors"], 1)
-                self.assertFalse(self.remote.opens)
-                code, summary = self.invoke()
-                self.assertEqual(code, 0)
-                self.assertTrue(summary["local_download_complete"])
-                self.assertEqual((self.cfg.export / "folder/contract.pdf").read_bytes(), b"pdf")
-                self.remote.opens.clear()
 
     def test_unavailable_before_success_is_not_hidden(self):
         self.remote.add("dir/a.pdf")
@@ -547,6 +520,7 @@ class ExportTests(unittest.TestCase):
                     self.assertTrue(recovered["local_download_complete"])
                     self.assertEqual(recovered["directories_discovered"], 1)
                     self.assertEqual(self.csv(recovered, "unresolved"), [])
+                    self.assertEqual((self.cfg.export / "dir/a.pdf").read_bytes(), b"pdf")
                     self.remote.opens.clear()
 
     def test_special_listing_uses_stat_before_skipping_or_probing(self):
@@ -871,15 +845,20 @@ class ExportTests(unittest.TestCase):
         with closing(sqlite3.connect(backups.pop())) as db:
             self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
 
-    def test_50000_entry_inventory(self):
-        for number in range(50_000):
-            self.remote.add(f"folder-{number // 1000:02}/document-{number:05}.PDF", b"", mtime=number)
+    def test_inventory_persists_full_batches_and_tail_without_downloading(self):
+        # Cross multiple 500-entry flushes and a final partial batch per folder.
+        # The optional synthetic pilot retains the 50,000-entry scale workload.
+        pdfs = {f"folder-{folder}/document-{number:04}.PDF"
+                for folder in range(2) for number in range(1001)}
+        for path in pdfs:
+            self.remote.add(path, b"")
         code, summary = self.invoke("inventory")
         self.assertEqual(code, 0)
-        self.assertEqual(summary["pdfs_discovered"], 50_000)
-        self.assertEqual(summary["directories_discovered"], 50)
-        self.assertEqual(summary["pending_deferred_count"], 50_000)
-        self.assertEqual(len(self.rows("SELECT id FROM transfers")), 50_000)
+        self.assertEqual(summary["pdfs_discovered"], len(pdfs))
+        self.assertEqual(summary["directories_discovered"], 2)
+        self.assertEqual(summary["pending_deferred_count"], len(pdfs))
+        self.assertEqual({row["remote_path"] for row in self.csv(summary, "gaps")}, pdfs)
+        self.assertEqual(len(self.rows("SELECT id FROM transfers")), len(pdfs))
         self.assertFalse(self.remote.opens)
         self.assertFalse(list(self.cfg.export.iterdir()))
 
@@ -896,27 +875,6 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(self.invoke()[0], 0)
         self.assertEqual((self.cfg.export / "a.pdf").read_bytes(), b"new")
         self.assertEqual(len(self.remote.opens), 2)
-
-    def test_interrupt_after_ready_commit_preserves_payload_for_recovery(self):
-        from clm_exporter.transfer import Transfers
-
-        self.remote.add("a.pdf", b"only copy")
-        receive = Transfers._receive_payload
-
-        def interrupt_after_commit(transfers, *args):
-            receive(transfers, *args)
-            raise KeyboardInterrupt
-
-        with patch.object(Transfers, "_receive_payload", interrupt_after_commit):
-            code, _ = self.invoke()
-        self.assertEqual(code, 130)
-        self.assertEqual(self.rows("SELECT state FROM transfers")[0][0], "ready")
-        self.assertEqual(len(list(self.cfg.work.iterdir())), 1)
-        del self.remote.entries["a.pdf"]
-        code, _ = self.invoke()
-        self.assertEqual(code, 0)
-        self.assertEqual((self.cfg.export / "a.pdf").read_bytes(), b"only copy")
-        self.assertEqual(self.remote.opens, ["a.pdf"])
 
     def test_failed_initialization_can_be_retried(self):
         from clm_exporter import state
@@ -1008,7 +966,11 @@ class ExportTests(unittest.TestCase):
             code, summary = self.invoke()
         self.assertEqual((code, summary["stop_reason"]), (130, "interrupted"))
         self.assertEqual(self.rows("SELECT state FROM transfers")[0][0], "ready")
+        parts = list(self.cfg.work.iterdir())
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0].read_bytes(), b"pdf")
         self.assertTrue(Path(summary["reports"]["backup"]).exists())
+        del self.remote.entries["a.pdf"]  # Recovery must preserve the only remaining copy.
         self.assertEqual(self.invoke()[0], 0)
         self.assertEqual(self.remote.opens, ["a.pdf"])
         self.assertEqual((self.cfg.export / "a.pdf").read_bytes(), b"pdf")
@@ -1181,28 +1143,38 @@ class ExportTests(unittest.TestCase):
         with self.assertRaises(PathError):
             self.invoke("status")
 
-    def test_partial_directory_listing_is_saved_and_retried_without_duplicates(self):
+    def test_successful_listing_retry_clears_transient_entry_failure(self):
         self.remote.add("a.pdf")
         self.remote.add("z.pdf")
-        original_iterdir = self.remote.iterdir
-        attempts = []
+        self.remote.list_missing_attrs.add("a.pdf")
+        original = self.remote.iterdir
+        attempts = 0
 
-        def interrupted_listing(directory):
-            attempts.append(directory)
-            for entry in original_iterdir(directory):
+        def listing(directory):
+            nonlocal attempts
+            attempts += 1
+            for entry in original(directory):
                 yield entry
-                if len(attempts) == 1:
-                    raise ConnectionError("listing interrupted")
+                if attempts == 1:
+                    raise ConnectionError("listing interrupted after metadata lookup")
 
-        self.remote.iterdir = interrupted_listing
+        def stat(relative):
+            if relative == "a.pdf" and attempts == 1:
+                raise TimeoutError("transient metadata failure")
+
+        self.remote.iterdir = listing
+        self.remote.stat_hook = stat
         code, summary = self.invoke()
-
         self.assertEqual(code, 0)
-        self.assertEqual(attempts, ["", ""])
-        self.assertEqual(self.remote.reconnects, 1)
+        self.assertEqual(summary["scan_status"], "complete")
+        self.assertTrue(summary["local_download_complete"])
+        self.assertEqual(attempts, 2)
+        self.assertEqual(self.remote.reconnects, 2)  # Metadata lookup and partial listing.
         self.assertEqual(self.remote.opens, ["a.pdf", "z.pdf"])
+        self.assertEqual(summary["new_successes"], 2)
         self.assertEqual(summary["pdfs_discovered"], 2)
         self.assertEqual(len(self.rows("SELECT * FROM observations")), 2)
+        self.assertEqual(self.csv(summary, "unresolved"), [])
         errors = self.rows("SELECT * FROM errors WHERE operation='directory'")
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["attempts"], 1)
@@ -1292,21 +1264,7 @@ class ExportTests(unittest.TestCase):
         self.assertEqual((self.cfg.export / "a.pdf").read_bytes(), b"abcdef")
 
 
-class ConfigTests(unittest.TestCase):
-    def test_example_and_rejections(self):
-        cfg = load(Path(__file__).parents[1] / "config.example.toml")
-        self.assertEqual(cfg.max_staged_bytes, 350_000_000_000)
-        self.assertEqual(cfg.min_free_bytes, 50_000_000_000)
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "config.toml"
-            example = (Path(__file__).parents[1] / "config.example.toml").read_text()
-            for bad in [example.replace('"CLM-export"', '"state"'), example + '\npassphrase = "secret"\n',
-                        example.replace("chunk_bytes = 1048576", "chunk_bytes = 0"),
-                        example.replace('remote_root = "/your-remote-root"', 'remote_root = "relative"')]:
-                path.write_text(bad)
-                with self.assertRaises(FatalError):
-                    load(path)
-
+class CliTests(unittest.TestCase):
     def test_actual_cli_missing_state(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.toml"

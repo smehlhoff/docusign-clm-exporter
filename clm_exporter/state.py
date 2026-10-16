@@ -101,6 +101,10 @@ class State:
             source = self.db.execute("SELECT * FROM source WHERE id=1").fetchone()
             if source is None or json.loads(source["identity"]) != cfg.identity or source["destination"] != str(cfg.export):
                 raise FatalError("Database is bound to a different source or destination")
+            # Additive indexes also upgrade existing version-1 databases. Both
+            # queues need indexed filtering AND ordering for bounded lookups.
+            self.db.execute("CREATE INDEX IF NOT EXISTS scans_pending ON scans(run_id,state,remote)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS paths_schedule ON paths(last_seen_run,selected,remote)")
         except BaseException:
             remove_created = created and self.db is None
             if self.db is not None:

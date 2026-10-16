@@ -64,12 +64,12 @@ def safe_target(root, relative, create_parents=False):
     return target
 
 
-def regular_open(path, flags=os.O_RDONLY):
+def regular_open(path, flags=os.O_RDONLY, *, buffering=-1):
     fd = os.open(path, flags | os.O_NOFOLLOW, 0o600)
     if not stat.S_ISREG(os.fstat(fd).st_mode):
         os.close(fd)
         raise PathError(f"Not a regular file: {path}")
-    return os.fdopen(fd, "rb" if flags == os.O_RDONLY else "wb")
+    return os.fdopen(fd, "rb" if flags == os.O_RDONLY else "wb", buffering=buffering)
 
 
 def digest_file(path):
@@ -182,3 +182,54 @@ class Capacity:
 
     def removed(self, amount):
         self.staged -= amount
+
+
+class Reservations(Capacity):
+    """One ledger for physical bytes and unwritten reservations across workers."""
+    def __init__(self, cfg, free=None):
+        import threading
+        super().__init__(cfg, free)
+        self.lock = threading.RLock()
+        self.remaining = {}
+
+    @property
+    def reserved(self):
+        with self.lock:
+            return sum(self.remaining.values())
+
+    def reserve(self, token, size):
+        with self.lock:
+            self.check(self.reserved + size)
+            if token in self.remaining:
+                raise RuntimeError("Duplicate capacity reservation")
+            self.remaining[token] = size
+
+    def release(self, token):
+        with self.lock:
+            self.remaining.pop(token, None)
+
+    def write(self, token, output, chunk):
+        # No network operation holds this lock. Flush/account even a partial
+        # write before another writer or admission can inspect the ledger.
+        with self.lock:
+            if len(chunk) > self.remaining[token]:
+                raise ValueError("Write exceeds capacity reservation")
+            if self.free() - self.reserved < self.cfg.min_free_bytes:
+                raise CapacityStop("disk_reserve")
+            before = os.fstat(output.fileno()).st_size
+            try:
+                remaining = memoryview(chunk)
+                while remaining:
+                    written = output.write(remaining)
+                    if not written:
+                        raise OSError("Local write made no progress")
+                    remaining = remaining[written:]
+                output.flush()
+            finally:
+                actual = os.fstat(output.fileno()).st_size - before
+                self.staged += actual
+                self.remaining[token] -= actual
+
+    def removed(self, amount):
+        with self.lock:
+            super().removed(amount)
