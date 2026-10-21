@@ -94,10 +94,6 @@ def import_csv(state, run, source, progress, checkpoint=None):
         nonlocal progress_at
         with state.transaction():
             for number, doc_id, name, location, remote in batch:
-                duplicate = db.execute("SELECT row_number FROM csv_entries WHERE run_id=? AND remote_path=?", (run, remote)).fetchone()
-                if duplicate:
-                    diagnostics.append((number, "duplicate_path", f"Duplicate resolved path; also present on row {duplicate[0]}: {remote}"))
-                    continue
                 parent = remote.rpartition("/")[0]
                 db.execute("""INSERT INTO csv_entries(run_id,row_number,document_id,document_name,location_path,remote_path,parent)
                     VALUES(?,?,?,?,?,?,?)""", (run, number, doc_id, name, location, remote, parent))

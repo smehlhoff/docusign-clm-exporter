@@ -20,7 +20,7 @@ from clm_exporter.cli import execute, parser
 from clm_exporter.config import Config
 from clm_exporter.errors import FatalError
 from clm_exporter.local import prepare_layout
-from clm_exporter.state import SCHEMA, SCHEMA_V2, State
+from clm_exporter.state import SCHEMA, SCHEMA_V2, SCHEMA_VERSION, State
 
 from .fakes import FakeRemote
 from .test_concurrency import Sessions
@@ -133,7 +133,7 @@ class CsvExportTests(unittest.TestCase):
         header = "DOCUMENT ID,DOCUMENT NAME,LOCATION PATH\n"
         cases = [
             "", header, "ID,NAME,PATH\na,a.pdf,/Main\n", "DOCUMENT ID,DOCUMENT NAME,LOCATION PATH,document id\na,a.pdf,/Main,b\n",
-            header + "id,a.pdf,/Main\nid,a.pdf,/Main/\n", header + "id,a.pdf,/Main,extra\n",
+            header + "id,a.pdf,/Main,extra\n",
             header + 'id,"a.pdf,/Main\n', header + 'id,a".pdf,/Main\n', header + 'id,"a.pdf"bad,/Main\n',
             header + "id,a.pdf,/MainArchive\n", header + "id,a.txt,/Main\n", header + " ,a.pdf,/Main\n",
             header + "id,../a.pdf,/Main\n", header + "id,a.pdf,Main\n", header + "id,a.pdf,/Main//X\n",
@@ -704,7 +704,7 @@ class MigrationTests(unittest.TestCase):
         self.assertIsNone(legacy["local_download_complete"])
         self.assertEqual(legacy["original_result_note"], "Original completion result unavailable")
         with sqlite3.connect(self.cfg.database) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
             self.assertEqual(db.execute("SELECT id,path_id FROM transfers").fetchall(), [(77, 42)])
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
         backup = next(self.cfg.backups.glob("*pre-migration*"))

@@ -44,6 +44,7 @@ def scan_csv(state, remote, run, progress, sleep=backoff):
     with state.transaction():
         db.execute("UPDATE runs SET scan_started_at=?,scan_status='running' WHERE id=?", (utcnow(), run))
     ancestor_total = db.execute("SELECT COUNT(*) FROM csv_ancestor_checks WHERE run_id=?", (run,)).fetchone()[0]
+    path_total = db.execute("SELECT COUNT(DISTINCT remote_path) FROM csv_entries WHERE run_id=?", (run,)).fetchone()[0]
     observed = 0
     progress_at = time.monotonic()
 
@@ -76,7 +77,7 @@ def scan_csv(state, remote, run, progress, sleep=backoff):
         if not ancestor:
             observed += 1
         if time.monotonic() - progress_at >= 5:
-            LOG.info("CSV metadata: %d/%d document checks settled", observed, imported["expected_count"])
+            LOG.info("CSV metadata: %d/%d unique path checks settled", observed, path_total)
             progress_at = time.monotonic()
 
     def process(rows, ancestor, bar):
@@ -130,6 +131,8 @@ def scan_csv(state, remote, run, progress, sleep=backoff):
             row = db.execute("""SELECT e.* FROM csv_entries e WHERE e.run_id=? AND e.lookup_state='pending'
                 AND e.row_number>? AND EXISTS(SELECT 1 FROM csv_ancestor_checks a
                     WHERE a.run_id=e.run_id AND a.remote=e.parent AND a.lookup_state='checked')
+                AND e.row_number=(SELECT MIN(first.row_number) FROM csv_entries first
+                    WHERE first.run_id=e.run_id AND first.remote_path=e.remote_path)
                 ORDER BY e.row_number LIMIT 1""", (run, last)).fetchone()
             if row is None:
                 return
@@ -140,12 +143,12 @@ def scan_csv(state, remote, run, progress, sleep=backoff):
         maximum = db.execute("SELECT MAX(depth) FROM csv_ancestor_checks WHERE run_id=?", (run,)).fetchone()[0]
         for depth in range(maximum + 1):
             process(ancestors(depth), True, bar)
-    with progress.bar(desc="Checking metadata", unit="document", total=imported["expected_count"]) as bar:
+    with progress.bar(desc="Checking metadata", unit="path", total=path_total) as bar:
         process(entries(), False, bar)
     complete = not db.execute("""SELECT 1 FROM csv_entries WHERE run_id=? AND lookup_state<>'checked'
         UNION ALL SELECT 1 FROM csv_ancestor_checks WHERE run_id=? AND lookup_state<>'checked' LIMIT 1""", (run, run)).fetchone()
     with state.transaction():
         db.execute("UPDATE runs SET scan_status=?,scan_ended_at=? WHERE id=?", ("complete" if complete else "incomplete", utcnow(), run))
         _schedule_transfers(state, run)
-    LOG.info("CSV metadata %s: %d/%d documents checked", "complete" if complete else "incomplete", observed, imported["expected_count"])
+    LOG.info("CSV metadata %s: %d/%d unique paths checked", "complete" if complete else "incomplete", observed, path_total)
     return complete

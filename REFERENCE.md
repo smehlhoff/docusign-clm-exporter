@@ -54,13 +54,18 @@ D02DC5F5-466A-43C0-95A8-A6B9F05C5F1F,test.pdf,/Main/Contracts/
 
 This row selects `/Main/Contracts/test.pdf`. Locations are absolute SFTP paths
 beneath your configured `remote_root`; names must include `.pdf` and be a single
-safe path component. Names and IDs retain their original spelling. Duplicate
-resolved paths, invalid rows, and empty reports reject the entire input before
-recovery or network work. Document IDs are report metadata: repeated IDs on
-different paths are allowed, and changing an ID alone does not repeat a download.
+safe path component. Names and IDs retain their original spelling. Repeated
+resolved paths are accepted: each unique, case-sensitive SFTP path is checked
+and downloaded once, and every matching CSV row retains its document ID and
+references the same transfer in the results. Different IDs at the same path
+still identify only the one file exposed at that SFTP path. A trailing slash on
+the location does not create a different path. Invalid rows and empty reports
+reject the entire input before recovery or network work. Document IDs are report
+metadata: repeated IDs on different paths are allowed, and changing an ID alone
+does not repeat a download.
 CSV file paths resolve from your current shell directory.
 
-CSV mode checks each distinct ancestor folder and listed file directly over SFTP,
+CSV mode checks each distinct ancestor folder and unique file path directly over SFTP,
 using the configured worker limit and no directory listings. Explicit ancestor
 symlinks or files block their descendants; independent files continue. The whole
 accepted list reserves stable local aliases before network work, including files
@@ -101,9 +106,13 @@ retaining successful transfers and saved coverage.
 
 ## State upgrades
 
-Existing state databases upgrade automatically to schema version 2 under the
+Existing state databases upgrade automatically to schema version 3 under the
 working-directory lock, after source/destination validation and a consistent
-`pre-migration-v2` backup. Keep that backup. Older binaries cannot open the upgraded
+`pre-migration-v3` backup. Keep that backup and any earlier migration backups.
+The upgrade retains existing input rows, path mappings, downloads, and saved
+results while allowing repeated CSV paths. Rerun a previously rejected CSV to
+import its duplicate rows; old rejection reports remain historical records.
+Older binaries cannot open the upgraded
 database; rolling back requires the matching backup and local state. Legacy runs
 without saved original results are labeled "Original completion result unavailable";
 their successful transfer history still prevents unchanged downloads.
@@ -140,6 +149,12 @@ The three CSV input reports are produced for CSV mode. Its document outcomes are
 `failed`, `unchecked`, `pending`, `downloaded_this_run`, and `previously_downloaded`.
 Their counts sum to the accepted input count. Unrelated historical errors remain
 visible with `in_current_scope=false` without blocking current CSV completion.
+`expected_document_count`, `document_outcomes`, and `metadata_checked` / `failed` /
+`unchecked` count CSV rows, including repeats. `unique_path_count` counts distinct
+paths and `duplicate_row_count` counts additional rows referencing those paths.
+PDF counts, coverage, unchanged skips, transfer totals, and byte totals count
+each path once; the gaps report also lists each outstanding path once. The
+absence report retains all rows whose path disappeared from the supplied list.
 Staging and history reports remain comprehensive for offloading. Zero-byte PDFs
 retain the existing successful-transfer behavior and review notice.
 

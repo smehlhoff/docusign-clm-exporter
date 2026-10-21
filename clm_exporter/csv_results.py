@@ -61,11 +61,13 @@ def collect_csv_results(state, run, scope, summary, errors, latest, paths, activ
     by_path, command_errors = scoped_errors(state, scope, errors) if accepted else ({}, [])
     counts = Counter({outcome: 0 for outcome in OUTCOMES})
     lookups = Counter({key: 0 for key in ("checked", "failed", "pending")})
+    unique_lookups = Counter()
+    unique_paths = set()
     ancestor_counts = Counter(dict(db.execute("SELECT lookup_state,COUNT(*) FROM csv_ancestor_checks WHERE run_id=? GROUP BY lookup_state", (scope,))))
-    gap_count = gap_bytes = observed_bytes = unknown_size = zero_bytes = unchanged = 0
+    gap_count = gap_bytes = observed_bytes = unknown_size = zero_bytes = unchanged = coverage = 0
 
     def documents():
-        nonlocal gap_count, gap_bytes, observed_bytes, unknown_size, zero_bytes, unchanged
+        nonlocal gap_count, gap_bytes, observed_bytes, unknown_size, zero_bytes, unchanged, coverage
         if not accepted:
             return
         for entry in db.execute("""SELECT e.*,o.size,o.mtime FROM csv_entries e LEFT JOIN observations o
@@ -91,13 +93,18 @@ def collect_csv_results(state, run, scope, summary, errors, latest, paths, activ
             covered = outcome in ("downloaded_this_run", "previously_downloaded")
             counts[outcome] += 1
             lookups[entry["lookup_state"]] += 1
-            observed_bytes += entry["size"] or 0
-            unknown_size += entry["size"] is None
-            zero_bytes += entry["size"] == 0
-            unchanged += outcome == "previously_downloaded"
-            if not covered:
-                gap_count += 1
-                gap_bytes += entry["size"] or 0
+            # Document outcomes count CSV rows; file/byte totals count paths.
+            if entry["remote_path"] not in unique_paths:
+                unique_paths.add(entry["remote_path"])
+                unique_lookups[entry["lookup_state"]] += 1
+                observed_bytes += entry["size"] or 0
+                unknown_size += entry["size"] is None
+                zero_bytes += entry["size"] == 0
+                unchanged += outcome == "previously_downloaded"
+                coverage += covered
+                if not covered:
+                    gap_count += 1
+                    gap_bytes += entry["size"] or 0
             yield {key: entry[key] for key in ("row_number", "document_id", "document_name", "location_path", "remote_path", "lookup_state", "size", "mtime")} | {
                 "mapped_path": path["local"] if path else None, "outcome": outcome,
                 "transfer_id": success["id"] if covered else active[path_id]["id"] if path_id in active else None,
@@ -111,9 +118,11 @@ def collect_csv_results(state, run, scope, summary, errors, latest, paths, activ
     def gaps():
         # Documents are saved in bounded batches by the caller. Reuse that
         # authoritative result instead of evaluating outcome precedence twice.
+        seen = set()
         for row in db.execute("SELECT data FROM result_rows WHERE run_id=? AND report='documents' ORDER BY ordinal", (run,)):
             doc = json.loads(row[0])
-            if doc["outcome"] not in ("downloaded_this_run", "previously_downloaded"):
+            if doc["outcome"] not in ("downloaded_this_run", "previously_downloaded") and doc["remote_path"] not in seen:
+                seen.add(doc["remote_path"])
                 yield dict(doc, state=doc["outcome"], reason=doc["error_message"] or doc["outcome"])
     write_csv("gaps", ["remote_path", "mapped_path", "size", "mtime", "state", "reason"], gaps())
     previous = imported["previous_run"] if accepted else None
@@ -131,12 +140,14 @@ def collect_csv_results(state, run, scope, summary, errors, latest, paths, activ
     unresolved = [e for e in errors if e["resolved_at"] is None]
     scoped = [e for e in unresolved if e.get("in_current_scope")]
     summary.update(
+        unique_path_count=len(unique_paths),
+        duplicate_row_count=(imported["expected_count"] - len(unique_paths)) if accepted else 0,
         document_outcomes=dict(counts), metadata_checked=lookups["checked"], metadata_failed=lookups["failed"],
         metadata_unchecked=lookups["pending"], ancestor_checks={key: ancestor_counts[key] for key in ("checked", "failed", "pending")},
         absence_count=absence_count, previous_accepted_csv_run=previous,
-        pdfs_discovered=lookups["checked"], bytes_discovered=observed_bytes, pdfs_with_unknown_size=unknown_size,
+        pdfs_discovered=unique_lookups["checked"], bytes_discovered=observed_bytes, pdfs_with_unknown_size=unknown_size,
         zero_byte_pdfs=zero_bytes, unchanged_skips=unchanged,
-        latest_version_coverage=counts["downloaded_this_run"] + counts["previously_downloaded"],
+        latest_version_coverage=coverage,
         pending_deferred_count=gap_count, pending_deferred_bytes=gap_bytes,
         unresolved_file_errors=sum(e["operation"] != "csv_ancestor" for e in scoped),
         unresolved_directory_errors=sum(e["operation"] == "csv_ancestor" for e in scoped),
@@ -146,8 +157,9 @@ def collect_csv_results(state, run, scope, summary, errors, latest, paths, activ
                                      and not gap_count and not scoped
                                      and summary["stop_reason"] not in ("fatal_error", "interrupted")),
     )
-    completed = list(db.execute("""SELECT t.* FROM transfers t JOIN csv_entries e ON e.path_id=t.path_id
-        WHERE e.run_id=? AND t.completion_run=? AND t.state='downloaded'""", (scope, run))) if accepted else []
+    completed = list(db.execute("""SELECT t.* FROM transfers t
+        WHERE t.completion_run=? AND t.state='downloaded'
+          AND EXISTS(SELECT 1 FROM csv_entries e WHERE e.run_id=? AND e.path_id=t.path_id)""", (run, scope))) if accepted else []
     changed = sum(db.execute("SELECT EXISTS(SELECT 1 FROM transfers WHERE path_id=? AND state='downloaded' AND id<?)",
                              (t["path_id"], t["id"])).fetchone()[0] for t in completed)
     all_completed = db.execute("SELECT COUNT(*) FROM transfers WHERE completion_run=? AND state='downloaded'", (run,)).fetchone()[0]

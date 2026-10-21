@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from .errors import FatalError
 from .local import sync_directory
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SCHEMA = """
 CREATE TABLE source (
  id INTEGER PRIMARY KEY CHECK(id=1), identity TEXT NOT NULL, destination TEXT NOT NULL,
@@ -111,6 +111,28 @@ CREATE INDEX publications_run ON publication_attempts(run_id,id);
 PRAGMA user_version=2;
 """
 
+# Keep each input row while allowing several rows to reference one SFTP path.
+# No table references csv_entries, so rebuilding this child table preserves all
+# path IDs, transfer history, input snapshots and finalized report rows.
+SCHEMA_V3 = """
+CREATE TABLE csv_entries_v3 (
+ run_id TEXT NOT NULL REFERENCES csv_imports(run_id), row_number INTEGER NOT NULL,
+ document_id TEXT NOT NULL, document_name TEXT NOT NULL, location_path TEXT NOT NULL,
+ remote_path TEXT NOT NULL, parent TEXT NOT NULL, path_id INTEGER REFERENCES paths(id),
+ lookup_state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+ category TEXT, message TEXT,
+ PRIMARY KEY(run_id,row_number)
+);
+INSERT INTO csv_entries_v3 SELECT * FROM csv_entries;
+DROP TABLE csv_entries;
+ALTER TABLE csv_entries_v3 RENAME TO csv_entries;
+CREATE INDEX csv_entries_pending ON csv_entries(run_id,lookup_state,row_number);
+CREATE INDEX csv_entries_path ON csv_entries(remote_path,run_id);
+CREATE INDEX csv_entries_path_id ON csv_entries(run_id,path_id);
+CREATE INDEX csv_entries_lookup ON csv_entries(run_id,remote_path,row_number);
+PRAGMA user_version=3;
+"""
+
 
 def utcnow():
     return datetime.now(UTC).isoformat(timespec="microseconds")
@@ -142,22 +164,23 @@ class State:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("PRAGMA synchronous=FULL")
             if created:
-                self.db.executescript("BEGIN IMMEDIATE;" + SCHEMA + SCHEMA_V2)
+                self.db.executescript("BEGIN IMMEDIATE;" + SCHEMA + SCHEMA_V2 + SCHEMA_V3)
                 self.db.execute("INSERT INTO source VALUES(1,?,?,NULL,?)",
                                 (json.dumps(cfg.identity), str(cfg.export), json.dumps(filesystem or {})))
                 self.db.execute("COMMIT")
                 sync_directory(cfg.state_dir)
             version = self.db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (1, SCHEMA_VERSION):
+            if version not in (1, 2, SCHEMA_VERSION):
                 raise FatalError(f"Unsupported database schema {version}; expected {SCHEMA_VERSION}")
             source = self.db.execute("SELECT * FROM source WHERE id=1").fetchone()
             if source is None or json.loads(source["identity"]) != cfg.identity or source["destination"] != str(cfg.export):
                 raise FatalError("Database is bound to a different source or destination")
-            if version == 1:
-                self.backup("pre-migration-v2-" + uuid.uuid4().hex)
+            if version < SCHEMA_VERSION:
+                self.backup("pre-migration-v3-" + uuid.uuid4().hex)
                 # executescript starts its own transaction; do not use it inside
                 # transaction(), where its implicit COMMIT would break atomicity.
-                self.db.executescript("BEGIN IMMEDIATE;" + SCHEMA_V2 + "COMMIT;")
+                upgrade = (SCHEMA_V2 if version == 1 else "") + SCHEMA_V3
+                self.db.executescript("BEGIN IMMEDIATE;" + upgrade + "COMMIT;")
             # Additive indexes also upgrade existing version-1 databases. Both
             # queues need indexed filtering AND ordering for bounded lookups.
             self.db.execute("CREATE INDEX IF NOT EXISTS scans_pending ON scans(run_id,state,remote)")

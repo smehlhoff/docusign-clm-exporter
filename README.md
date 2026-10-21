@@ -71,7 +71,8 @@ D02DC5F5-466A-43C0-95A8-A6B9F05C5F1F,test.pdf,/Main/Contracts/
 
 This selects `/Main/Contracts/test.pdf`; locations must be absolute SFTP paths
 beneath `remote_root`. CSV mode checks listed files directly, without directory
-listings. Completion applies to the supplied list. See
+listings. Repeated paths download once, with every CSV row and document ID retained
+in the results. Completion applies to the supplied list. See
 [CSV rules and final reconciliation](REFERENCE.md#csv-exports).
 
 ## Offload and continue
