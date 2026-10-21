@@ -305,7 +305,7 @@ def publication_summary(state, run, attempt):
 # Keep the full durable result for reconstruction; publish a focused view by default.
 COMPACT_FIELDS = (
     "run_id", "command", "discovery_mode", "started_at", "ended_at", "stop_reason",
-    "scan_status", "import_status", "input_source", "local_download_complete", "export_exit_code",
+    "scan_status", "import_status", "input_source", "local_download_complete",
     "invocation_exit_code", "original_results_available", "original_result_note",
     "expected_document_count", "unique_path_count", "duplicate_row_count", "document_outcomes",
     "directories_discovered", "pdfs_discovered", "latest_version_coverage", "new_successes", "changed_or_repeated_successes",

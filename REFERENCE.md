@@ -135,6 +135,8 @@ By default, only **staging, gaps, unresolved, and documents (CSV mode)** are
 published. Import-errors and current-integrity CSVs are added only when errors
 exist. `summary.json` and stdout show a compact view of completion, row/path
 counts, transfers, outstanding work, staging integrity, and publication failures.
+Use `local_download_complete` to check completion and `invocation_exit_code` for
+the command's outcome. The saved `export_exit_code` appears only in detailed summaries.
 The compact view includes `source.remote_root` and, for CSV mode, `input_source`
 (the input CSV path). `pdfs_with_unknown_size` and `zero_byte_pdfs` count distinct
 paths, not repeated CSV rows. Unknown sizes do not contribute to byte totals;

@@ -1,5 +1,6 @@
 """Terminal-only tqdm display; progress never becomes part of the JSON output."""
 import logging
+import re
 import sys
 from contextlib import contextmanager
 
@@ -11,7 +12,17 @@ def load_tqdm():
         from tqdm import tqdm
     except ImportError as exc:
         raise FatalError("tqdm is missing; install requirements.txt or use --no-progress") from exc
-    return tqdm
+    class SpacedTqdm(tqdm):
+        @property
+        def format_dict(self):
+            details = super().format_dict
+            # Format only the rate, preserving tqdm's scaling and slow-rate
+            # inversion without changing units or text in document names.
+            rate = tqdm.format_meter(**dict(details, bar_format="{rate_fmt}"))
+            details["spaced_rate"] = re.sub(r"^(\s*[\d.]+|\?)(\S)", r"\1 \2", rate)
+            return details
+
+    return SpacedTqdm
 
 
 class QuietBar:
@@ -34,9 +45,14 @@ class Progress:
         # Only the byte bar uses tqdm's ETA, once it has measured a transfer rate.
         if options.get("unit") != "B":
             options["bar_format"] = (
-                "{desc}: {n_fmt} {unit} [{elapsed}, {rate_fmt}]"
+                "{desc}: {n_fmt} {unit} [{elapsed}, {spaced_rate}]"
                 if options.get("total") is None
-                else "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}, {rate_fmt}]"
+                else "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}, {spaced_rate}]"
+            )
+        else:
+            options["bar_format"] = (
+                "{l_bar}{bar}| {n_fmt}/{total_fmt} "
+                "[{elapsed}<{remaining}, {spaced_rate}{postfix}]"
             )
         with self.tqdm(file=self.stream, dynamic_ncols=True, mininterval=0.2,
                        miniters=1, disable=False, **options) as bar:
