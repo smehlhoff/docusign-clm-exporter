@@ -835,11 +835,10 @@ class ExportTests(unittest.TestCase):
     def test_reconstructed_report_failure_still_backs_up_state(self):
         _, original = self.invoke("inventory")
         before = set(self.cfg.backups.iterdir())
-        with (
-            patch("clm_exporter.cli.write_reports", side_effect=OSError("report write failed")),
-            self.assertRaisesRegex(OSError, "report write failed"),
-        ):
-            self.invoke("status", report_run=original["run_id"])
+        with patch("clm_exporter.cli.write_reports", side_effect=OSError("report write failed")):
+            code, summary = self.invoke("status", report_run=original["run_id"])
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["publication"]["reports_status"], "failed")
         backups = set(self.cfg.backups.iterdir()) - before
         self.assertEqual(len(backups), 1)
         with closing(sqlite3.connect(backups.pop())) as db:

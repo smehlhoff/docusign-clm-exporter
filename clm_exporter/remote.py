@@ -77,7 +77,10 @@ class Remote:
             try:
                 self.key = paramiko.RSAKey.from_private_key_file(str(cfg.private_key_path))
             except paramiko.PasswordRequiredException:
-                secret = getpass.getpass("RSA private-key passphrase: ")
+                try:
+                    secret = getpass.getpass("RSA private-key passphrase: ")
+                except EOFError as exc:
+                    raise FatalError("Cannot read RSA private-key passphrase; run from an interactive terminal") from exc
                 try:
                     self.key = paramiko.RSAKey.from_private_key_file(str(cfg.private_key_path), password=secret)
                 finally:

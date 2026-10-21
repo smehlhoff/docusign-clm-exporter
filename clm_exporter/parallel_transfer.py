@@ -1,5 +1,4 @@
 """Coordinator-owned concurrent transfer state machines and network-only payloads."""
-import errno
 import hashlib
 import logging
 import os
@@ -11,7 +10,7 @@ from functools import partial
 from sqlite3 import Row
 from typing import Any
 
-from .errors import CapacityStop, MetadataError, PathError, SourceChanged, category
+from .errors import CapacityStop, MetadataError, PathError, SourceChanged
 from .local import (
     Reservations,
     footprint,
@@ -117,23 +116,10 @@ class ParallelTransfers(Transfers):
                 raise
             except (OSError, EOFError, MetadataError, PathError, SourceChanged) as exc:
                 job = self.get_job(job["id"])
-                ready = job["state"] in ("ready", "downloaded")
-                if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
-                    if not ready:
-                        self.discard(job, "pending")
-                    raise CapacityStop("disk_reserve") from exc
-                if ready:
-                    # Never destroy a durable ready payload because promotion failed.
-                    self.state.error(self.run, path["remote"], "recovery", category(exc), exc, attempt)
-                    LOG.error("Promotion failed for %r: %s", path["remote"], exc)
+                if not self._record_transfer_failure(job, path, attempt, exc):
                     return
-                self.discard(job, "failed", str(exc))
-                self.state.error(self.run, path["remote"], "transfer", category(exc), exc, attempt)
-                LOG.warning("Transfer attempt %d failed for %r: %s", attempt, path["remote"], exc)
                 yield lambda remote, emit, error=exc: remote.reconnect(error)
-                if (isinstance(exc, (PermissionError, FileNotFoundError, MetadataError, PathError))
-                        or isinstance(exc, OSError) and exc.errno == errno.ENAMETOOLONG
-                        or attempt == self.cfg.max_attempts):
+                if not self._retry_allowed(exc, attempt):
                     return
                 yield lambda remote, emit, delay=attempt: self.sleep(delay)
 
@@ -149,7 +135,7 @@ class ParallelTransfers(Transfers):
         selection = """FROM paths p
             WHERE p.last_seen_run=? AND p.selected=1 AND p.local IS NOT NULL
               AND p.size IS NOT NULL AND p.mtime IS NOT NULL
-              AND EXISTS(SELECT 1 FROM transfers t WHERE t.path_id=p.id AND t.state IN ('pending','failed'))"""
+              AND EXISTS(SELECT 1 FROM transfers t WHERE t.path_id=p.id AND t.state IN ('pending','failed'))""" + self.state.scope_clause(self.run, "p")
         total = self.db.execute("SELECT count(*) " + selection, (self.run,)).fetchone()[0]
         pool = self.remote
         file_steps_by_slot: dict[int, Generator[Callable[..., Any] | Reservation, Any, None]] = {}

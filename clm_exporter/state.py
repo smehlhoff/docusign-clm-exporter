@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from .errors import FatalError
 from .local import sync_directory
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA = """
 CREATE TABLE source (
  id INTEGER PRIMARY KEY CHECK(id=1), identity TEXT NOT NULL, destination TEXT NOT NULL,
@@ -59,6 +59,58 @@ CREATE INDEX unresolved_errors ON errors(remote, operation) WHERE resolved_at IS
 PRAGMA user_version=1;
 """
 
+# These additions are also the transactional upgrade for existing exports.
+SCHEMA_V2 = """
+ALTER TABLE runs ADD COLUMN discovery_mode TEXT NOT NULL DEFAULT 'recursive';
+CREATE TABLE csv_imports (
+ run_id TEXT PRIMARY KEY REFERENCES runs(id), source_path TEXT NOT NULL,
+ digest TEXT, state TEXT NOT NULL DEFAULT 'importing', expected_count INTEGER NOT NULL DEFAULT 0,
+ accepted_at TEXT, previous_run TEXT REFERENCES csv_imports(run_id),
+ mapping_complete INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE csv_entries (
+ run_id TEXT NOT NULL REFERENCES csv_imports(run_id), row_number INTEGER NOT NULL,
+ document_id TEXT NOT NULL, document_name TEXT NOT NULL, location_path TEXT NOT NULL,
+ remote_path TEXT NOT NULL, parent TEXT NOT NULL, path_id INTEGER REFERENCES paths(id),
+ lookup_state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+ category TEXT, message TEXT,
+ PRIMARY KEY(run_id,row_number), UNIQUE(run_id,remote_path)
+);
+CREATE INDEX csv_entries_pending ON csv_entries(run_id,lookup_state,row_number);
+CREATE INDEX csv_entries_path ON csv_entries(remote_path,run_id);
+CREATE INDEX csv_entries_path_id ON csv_entries(run_id,path_id);
+CREATE TABLE csv_ancestor_checks (
+ run_id TEXT NOT NULL REFERENCES csv_imports(run_id), remote TEXT NOT NULL,
+ parent TEXT, depth INTEGER NOT NULL, lookup_state TEXT NOT NULL DEFAULT 'pending',
+ attempts INTEGER NOT NULL DEFAULT 0, attributes TEXT, category TEXT, message TEXT,
+ PRIMARY KEY(run_id,remote)
+);
+CREATE INDEX csv_ancestors_pending ON csv_ancestor_checks(run_id,lookup_state,depth,remote);
+CREATE TABLE csv_import_errors (
+ id INTEGER PRIMARY KEY, run_id TEXT NOT NULL REFERENCES csv_imports(run_id),
+ row_number INTEGER, category TEXT NOT NULL, message TEXT NOT NULL
+);
+CREATE INDEX csv_import_errors_run ON csv_import_errors(run_id,id);
+CREATE TABLE run_results (
+ run_id TEXT PRIMARY KEY REFERENCES runs(id), finalized_at TEXT NOT NULL, summary TEXT NOT NULL
+);
+CREATE TABLE result_rows (
+ run_id TEXT NOT NULL REFERENCES runs(id), report TEXT NOT NULL, ordinal INTEGER NOT NULL,
+ data TEXT NOT NULL, PRIMARY KEY(run_id,report,ordinal)
+);
+CREATE TABLE result_reports (
+ run_id TEXT NOT NULL REFERENCES runs(id), report TEXT NOT NULL, fields TEXT NOT NULL,
+ PRIMARY KEY(run_id,report)
+);
+CREATE TABLE publication_attempts (
+ id INTEGER PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), started_at TEXT NOT NULL,
+ ended_at TEXT, is_retry INTEGER NOT NULL, reports_status TEXT NOT NULL DEFAULT 'pending',
+ backup_status TEXT NOT NULL DEFAULT 'pending', diagnostic TEXT, exit_code INTEGER
+);
+CREATE INDEX publications_run ON publication_attempts(run_id,id);
+PRAGMA user_version=2;
+"""
+
 
 def utcnow():
     return datetime.now(UTC).isoformat(timespec="microseconds")
@@ -90,17 +142,22 @@ class State:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("PRAGMA synchronous=FULL")
             if created:
-                self.db.executescript("BEGIN IMMEDIATE;" + SCHEMA)
+                self.db.executescript("BEGIN IMMEDIATE;" + SCHEMA + SCHEMA_V2)
                 self.db.execute("INSERT INTO source VALUES(1,?,?,NULL,?)",
                                 (json.dumps(cfg.identity), str(cfg.export), json.dumps(filesystem or {})))
                 self.db.execute("COMMIT")
                 sync_directory(cfg.state_dir)
             version = self.db.execute("PRAGMA user_version").fetchone()[0]
-            if version != SCHEMA_VERSION:
+            if version not in (1, SCHEMA_VERSION):
                 raise FatalError(f"Unsupported database schema {version}; expected {SCHEMA_VERSION}")
             source = self.db.execute("SELECT * FROM source WHERE id=1").fetchone()
             if source is None or json.loads(source["identity"]) != cfg.identity or source["destination"] != str(cfg.export):
                 raise FatalError("Database is bound to a different source or destination")
+            if version == 1:
+                self.backup("pre-migration-v2-" + uuid.uuid4().hex)
+                # executescript starts its own transaction; do not use it inside
+                # transaction(), where its implicit COMMIT would break atomicity.
+                self.db.executescript("BEGIN IMMEDIATE;" + SCHEMA_V2 + "COMMIT;")
             # Additive indexes also upgrade existing version-1 databases. Both
             # queues need indexed filtering AND ordering for bounded lookups.
             self.db.execute("CREATE INDEX IF NOT EXISTS scans_pending ON scans(run_id,state,remote)")
@@ -139,15 +196,25 @@ class State:
             self.db.rollback()
             raise
 
-    def run(self, command):
+    def run(self, command, discovery_mode="recursive"):
         run = datetime.now(UTC).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:12]
         with self.transaction():
-            self.db.execute("INSERT INTO runs(id,command,started_at) VALUES(?,?,?)", (run, command, utcnow()))
+            self.db.execute("INSERT INTO runs(id,command,started_at,discovery_mode) VALUES(?,?,?,?)",
+                            (run, command, utcnow(), discovery_mode))
         return run
 
     def latest(self, path_id):
         return self.db.execute("SELECT * FROM transfers WHERE path_id=? AND state='downloaded' ORDER BY id DESC LIMIT 1",
                                (path_id,)).fetchone()
+
+    def scope_clause(self, run, alias="paths"):
+        """SQL restriction for checked members; run remains a bound parameter."""
+        mode = self.db.execute("SELECT discovery_mode FROM runs WHERE id=?", (run,)).fetchone()[0]
+        if mode == "csv":
+            return (f" AND EXISTS(SELECT 1 FROM csv_entries ce JOIN csv_imports ci ON ci.run_id=ce.run_id"
+                    f" WHERE ce.run_id={alias}.last_seen_run AND ce.remote_path={alias}.remote"
+                    " AND ce.lookup_state='checked' AND ci.state='accepted')")
+        return ""
 
     def job(self, path, run, forced=False):
         active = self.db.execute("SELECT * FROM transfers WHERE path_id=? AND state IN ('pending','failed','downloading','ready')",

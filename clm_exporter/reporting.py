@@ -36,16 +36,47 @@ def csv_file(
     def write(stream: TextIO) -> None:
         writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(dict(row) for row in rows)
     atomic_write(path, write)
 
 
-def write_reports(
+def _history_rows(
+    state: State,
+    latest: dict[int, Row],
+    paths: dict[int, Row],
+    present: set[int],
+    *,
+    completion_run: str | None = None,
+) -> Iterable[dict[str, Any]]:
+    """Use the same version and payload labels for saved and published history."""
+    for transfer in state.db.execute("SELECT * FROM transfers WHERE state='downloaded' ORDER BY id"):
+        if completion_run is not None and transfer["completion_run"] != completion_run:
+            continue
+        path = paths[transfer["path_id"]]
+        if latest[path["id"]]["id"] != transfer["id"]:
+            payload_status = "superseded"
+        elif path["id"] in present:
+            payload_status = "staged"
+        else:
+            payload_status = "absent_or_unverified"
+        yield dict(transfer, remote_path=path["remote"], mapped_path=path["local"],
+                   transfer_id=transfer["id"], payload_status=payload_status)
+
+
+def finalize_results(
     state: State, run: str, scan_run: str | None = None, backup_run: str | None = None
 ) -> dict[str, Any]:
-    """Verify current staging and persist reports for a recorded run and scan."""
+    """Save immutable outcomes before any report or backup publication."""
     db, cfg = state.db, state.cfg
     record = db.execute("SELECT * FROM runs WHERE id=?", (run,)).fetchone()
+    existing = db.execute("SELECT summary FROM run_results WHERE run_id=?", (run,)).fetchone()
+    if existing:
+        return json.loads(existing[0])
+    online = latest_online(state) if record["command"] == "status" else None
+    if online:
+        scan_run = online["id"]
+    elif record["command"] in ("inventory", "download", "reconcile"):
+        scan_run = run
     if scan_run is None:
         previous = db.execute("""SELECT id FROM runs WHERE scan_started_at IS NOT NULL
             AND started_at<=? ORDER BY started_at DESC LIMIT 1""", (record["started_at"],)).fetchone()
@@ -58,12 +89,17 @@ def write_reports(
     locations["path_map"] = str(cfg.reports / "path-map.csv")
     locations["log"] = f"{base}.log"
     locations["backup"] = str(cfg.backups / f"export-{backup_run or run}.sqlite3")
+    csv_scope = (online["id"] if online else run) if record["discovery_mode"] == "csv" else None
+    if csv_scope:
+        for name in ("documents", "absent_from_report", "import_errors"):
+            locations[name] = f"{base}-{name.replace('_', '-')}.csv"
     if record["command"] == "init":
         locations = {"backup": locations["backup"]}
 
     def write_csv(name, fields, rows):
-        if name in locations:
-            csv_file(Path(locations[name]), fields, rows)
+        if name not in locations or name in ("history", "path_map"):
+            return
+        save_rows(state, run, name, fields, rows)
 
     latest = {r["path_id"]: r for r in db.execute("""SELECT t.* FROM transfers t
         WHERE t.state='downloaded' AND t.id=(SELECT MAX(t2.id) FROM transfers t2 WHERE t2.path_id=t.path_id AND t2.state='downloaded')""")}
@@ -79,33 +115,35 @@ def write_reports(
     transfer_fields = ["remote_path", "mapped_path", "size", "mtime", "sha256", "completed_at", "completion_run", "transfer_id", "forced"]
     write_csv("staging", transfer_fields, staged)
 
-    def history_rows(only_run=False):
-        for transfer in db.execute("SELECT * FROM transfers WHERE state='downloaded' ORDER BY id"):
-            if only_run and transfer["completion_run"] != run:
-                continue
-            path = paths[transfer["path_id"]]
-            is_latest = latest[path["id"]]["id"] == transfer["id"]
-            yield dict(transfer, remote_path=path["remote"], mapped_path=path["local"], transfer_id=transfer["id"],
-                       payload_status="superseded" if not is_latest else "staged" if path["id"] in present else "absent_or_unverified")
-    write_csv("downloads", [field for field in transfer_fields if field != "completion_run"] + ["payload_status"], history_rows(True))
-    write_csv("history", transfer_fields + ["payload_status"], history_rows())
+    write_csv("downloads", [field for field in transfer_fields if field != "completion_run"] + ["payload_status"],
+              _history_rows(state, latest, paths, present, completion_run=run))
+    write_csv("history", transfer_fields + ["payload_status"], _history_rows(state, latest, paths, present))
     write_csv("path_map", ["remote_path", "mapped_path", "kind", "last_seen_run"],
              (dict(p, remote_path=p["remote"], mapped_path=p["local"]) for p in paths.values()))
     errors = [dict(e, remote_path=e["remote"], mapped_path=e["local"], attempt_count=e["attempts"])
               for e in db.execute("SELECT e.*,p.local FROM errors e LEFT JOIN paths p ON p.remote=e.remote ORDER BY e.id")]
     error_fields = ["run_id", "timestamp", "remote_path", "mapped_path", "operation", "category", "attempt_count", "message"]
+    if not csv_scope:
+        # A rejected force request did not create durable work. It belongs to
+        # that invocation; status still assesses the latest online invocation.
+        # Valid forced jobs remain in the active transfer set until completed.
+        for error in errors:
+            error["in_current_scope"] = error["operation"] != "force" or error["run_id"] == scan_run
+        error_fields.append("in_current_scope")
     write_csv("failures", error_fields + ["resolved_at", "resolved_run"], (e for e in errors if e["run_id"] == run))
     unresolved = [e for e in errors if e["resolved_at"] is None]
+    blocking_errors = [e for e in unresolved if e.get("in_current_scope", True)]
     write_csv("unresolved", error_fields, unresolved)
-    observations = db.execute("SELECT * FROM observations WHERE run_id=? AND selected=1", (scan_run,)).fetchall() if scan_run else []
+    observations = db.execute("SELECT * FROM observations WHERE run_id=? AND selected=1", (scan_run,)).fetchall() if scan_run and not csv_scope else []
     # Count the scan's observations, not paths retained from earlier runs.
     # The configured root is not a discovered entry and is excluded.
     directories_discovered = db.execute(
         "SELECT COUNT(*) FROM observations WHERE run_id=? AND kind='directory'", (scan_run,)
     ).fetchone()[0]
     active = {t["path_id"]: t for t in db.execute("SELECT * FROM transfers WHERE state IN ('pending','failed','ready','downloading')")}
-    gaps, covered, unchanged = _download_gaps(observations, latest, paths, active, run)
-    write_csv("gaps", ["remote_path", "mapped_path", "size", "mtime", "state", "reason"], gaps)
+    gaps, covered, unchanged = _download_gaps(observations, latest, paths, active, run) if not csv_scope else ([], 0, 0)
+    if not csv_scope:
+        write_csv("gaps", ["remote_path", "mapped_path", "size", "mtime", "state", "reason"], gaps)
     completed = list(db.execute("SELECT * FROM transfers WHERE completion_run=? AND state='downloaded'", (run,)))
     changed = sum(db.execute("SELECT EXISTS(SELECT 1 FROM transfers WHERE path_id=? AND state='downloaded' AND id<?)",
                              (t["path_id"], t["id"])).fetchone()[0] for t in completed)
@@ -113,7 +151,8 @@ def write_reports(
     source_identity = dict(zip(("host", "port", "username", "remote_root"), json.loads(source["identity"]), strict=True))
     scan_complete = bool(scan and scan["scan_status"] == "complete")
     summary = {
-        "run_id": run, "command": record["command"], "started_at": record["started_at"], "ended_at": record["ended_at"],
+        "run_id": run, "command": record["command"], "discovery_mode": record["discovery_mode"],
+        "started_at": record["started_at"], "ended_at": record["ended_at"],
         "generated_at": utcnow(), "stop_reason": record["stop_reason"], "source": source_identity,
         "destination": str(cfg.export), "host_key_fingerprint": source["host_key_fingerprint"],
         "scan_run": scan_run, "scan_status": scan["scan_status"] if scan else "not_started",
@@ -125,20 +164,238 @@ def write_reports(
         "forced_successes": sum(t["forced"] for t in completed), "downloaded_bytes": sum(t["size"] for t in completed),
         "zero_byte_pdfs": sum(p["size"] == 0 for p in observations), "latest_version_coverage": covered,
         "pending_deferred_count": len(gaps), "pending_deferred_bytes": sum(p["size"] or 0 for p in gaps),
-        "unresolved_file_errors": sum(e["operation"] != "directory" for e in unresolved),
-        "unresolved_directory_errors": sum(e["operation"] == "directory" for e in unresolved),
+        "unresolved_file_errors": sum(e["operation"] != "directory" for e in blocking_errors),
+        "unresolved_directory_errors": sum(e["operation"] == "directory" for e in blocking_errors),
+        "historical_unresolved_errors": len(unresolved) - len(blocking_errors),
         "historical_successful_transfers": db.execute("SELECT COUNT(*) FROM transfers WHERE state='downloaded'").fetchone()[0],
         "historically_downloaded_paths": len(latest), "currently_staged_completed_pdfs": len(staged),
         "historically_downloaded_absent_or_unverified": len(latest) - len(staged),
         "current_staged_bytes": staged_bytes, "current_free_bytes": shutil.disk_usage(cfg.export).free,
-        "local_download_complete": scan_complete and not gaps and not unresolved and record["stop_reason"] not in ("fatal_error", "interrupted"),
+        "local_download_complete": scan_complete and not gaps and not blocking_errors and record["stop_reason"] not in ("fatal_error", "interrupted"),
         "reports": locations,
     }
-    # Persist summary before file output so a report-write interruption is reconstructable.
+    if csv_scope:
+        from .csv_results import collect_csv_results
+        collect_csv_results(state, run, csv_scope, summary, errors, latest, paths, active, write_csv)
+        # Status reassesses current integrity. The nested original result stays
+        # immutable, and rejected or interrupted input must still fail.
+        if online and summary["import_status"] != "accepted":
+            summary["stop_reason"] = "interrupted" if summary["import_status"] in ("importing", "interrupted") else "fatal_error"
+    if online:
+        # Offline status cannot turn a failed or unfinished online attempt into
+        # successful reconciliation, even when a scan covered all known files.
+        reason = online["stop_reason"] if online["ended_at"] else "interrupted"
+        if reason in ("fatal_error", "interrupted"):
+            summary["stop_reason"] = reason
+            summary["local_download_complete"] = False
+    summary["original_results_available"] = True
+    summary["export_exit_code"] = export_outcome(record["command"], summary)
     with state.transaction():
         db.execute("UPDATE runs SET summary=? WHERE id=?", (json.dumps(summary), run))
-    if "summary" in locations:
-        atomic_write(Path(locations["summary"]), lambda f: json.dump(summary, f, indent=2, ensure_ascii=True))
+        db.execute("INSERT INTO run_results VALUES(?,?,?)", (run, utcnow(), json.dumps(summary)))
+    return summary
+
+
+def save_rows(state, run, name, fields, rows):
+    """Persist independently bounded batches; only run_results finalizes them."""
+    with state.transaction():
+        state.db.execute("DELETE FROM result_rows WHERE run_id=? AND report=?", (run, name))
+        state.db.execute("INSERT OR REPLACE INTO result_reports VALUES(?,?,?)", (run, name, json.dumps(fields)))
+    batch = []
+    for ordinal, row in enumerate(rows):
+        values = dict(row)
+        batch.append((run, name, ordinal, json.dumps({field: values.get(field) for field in fields}, ensure_ascii=True)))
+        if len(batch) == 500:
+            with state.transaction():
+                state.db.executemany("INSERT INTO result_rows VALUES(?,?,?,?)", batch)
+            batch.clear()
+    if batch:
+        with state.transaction():
+            state.db.executemany("INSERT INTO result_rows VALUES(?,?,?,?)", batch)
+
+
+def saved_rows(state, run, name):
+    for row in state.db.execute("SELECT data FROM result_rows WHERE run_id=? AND report=? ORDER BY ordinal", (run, name)):
+        yield json.loads(row[0])
+
+
+def latest_online(state):
+    return state.db.execute("""SELECT * FROM runs WHERE command IN ('inventory','download','reconcile')
+        ORDER BY started_at DESC LIMIT 1""").fetchone()
+
+
+def status_context(state):
+    def details(record):
+        if record is None:
+            return None
+        result = {key: record[key] for key in ("id", "started_at", "command", "discovery_mode", "stop_reason")}
+        imported = state.db.execute("SELECT * FROM csv_imports WHERE run_id=?", (record["id"],)).fetchone()
+        if imported:
+            result.update(import_status=imported["state"], input_digest=imported["digest"],
+                          expected_document_count=imported["expected_count"] if imported["state"] == "accepted" else 0,
+                          validation_errors=[dict(row) for row in state.db.execute(
+                              "SELECT row_number,category,message FROM csv_import_errors WHERE run_id=? ORDER BY id LIMIT 20", (record["id"],))])
+            result["mapping_complete"] = bool(imported["mapping_complete"])
+            result["metadata_counts"] = dict(state.db.execute(
+                "SELECT lookup_state,COUNT(*) FROM csv_entries WHERE run_id=? GROUP BY lookup_state", (record["id"],)))
+            if imported["state"] == "importing":
+                result["import_diagnostic"] = "CSV import unfinished; partial rows are not accepted input"
+        saved = state.db.execute("SELECT summary FROM run_results WHERE run_id=?", (record["id"],)).fetchone()
+        result["results_status"] = "finalized" if saved else "unfinished_or_legacy"
+        if saved:
+            original = json.loads(saved[0])
+            result.update({key: original.get(key) for key in ("local_download_complete", "document_outcomes", "export_exit_code")})
+        else:
+            result["local_download_complete"] = None
+        return result
+    accepted = state.db.execute("""SELECT r.* FROM runs r JOIN csv_imports c ON c.run_id=r.id
+        WHERE c.state='accepted' ORDER BY c.accepted_at DESC LIMIT 1""").fetchone()
+    return {"latest_online_attempt": details(latest_online(state)), "last_accepted_csv_run": details(accepted)}
+
+
+def export_outcome(command, summary):
+    if summary.get("stop_reason") == "fatal_error":
+        return 1
+    if summary.get("stop_reason") == "interrupted":
+        return 130
+    if summary.get("unresolved_file_errors") or summary.get("unresolved_directory_errors"):
+        return 2
+    if summary.get("scan_status") in ("incomplete", "running"):
+        return 2
+    if summary.get("discovery_mode") == "csv" and (
+        summary.get("metadata_unchecked") or summary.get("metadata_failed")
+        or summary.get("ancestor_checks", {}).get("pending")
+        or summary.get("ancestor_checks", {}).get("failed")
+    ):
+        return 2
+    if command == "reconcile" and not summary.get("local_download_complete"):
+        return 2
+    return 0
+
+
+def result_summary(state, run):
+    """Never invent a historical outcome for a legacy or unfinished run."""
+    saved = state.db.execute("SELECT summary FROM run_results WHERE run_id=?", (run,)).fetchone()
+    if saved:
+        return json.loads(saved[0])
+    record = state.db.execute("SELECT * FROM runs WHERE id=?", (run,)).fetchone()
+    retained = json.loads(record["summary"]) if record["summary"] else {}
+    summary = {key: retained[key] for key in ("source", "destination", "host_key_fingerprint") if key in retained}
+    if retained:
+        summary["retained_summary"] = retained.get("retained_summary", retained)
+    summary.update(run_id=run, command=record["command"], discovery_mode=record["discovery_mode"],
+                   started_at=record["started_at"], ended_at=record["ended_at"], stop_reason=record["stop_reason"],
+                   original_results_available=False, original_result_note="Original completion result unavailable")
+    summary.update(local_download_complete=None, export_exit_code=None, reports={})
+    imported = state.db.execute("SELECT * FROM csv_imports WHERE run_id=?", (run,)).fetchone()
+    if imported:
+        summary.update(import_status=imported["state"], input_digest=imported["digest"],
+                       expected_document_count=imported["expected_count"] if imported["state"] == "accepted" else 0)
+    return summary
+
+
+def publication_summary(state, run, attempt):
+    original = state.db.execute("SELECT * FROM publication_attempts WHERE run_id=? AND is_retry=0 ORDER BY id LIMIT 1", (run,)).fetchone()
+    current = state.db.execute("SELECT * FROM publication_attempts WHERE id=?", (attempt,)).fetchone()
+    return {"original_exit_code": original["exit_code"] if original else None,
+            "original_publication": dict(original) if original else None,
+            "publication": dict(current), "invocation_exit_code": current["exit_code"]}
+
+
+def write_reports(state, run, scan_run=None, backup_run=None, *, verification_run=None):
+    """Publish saved coverage alongside a separate current staging assessment."""
+    db, cfg = state.db, state.cfg
+    summary = result_summary(state, run)
+    summary.update(status_context(state))
+    base = cfg.reports / f"run-{run}"
+    locations = dict(summary["reports"])
+    locations["backup"] = str(cfg.backups / f"export-{backup_run or run}.sqlite3")
+    summary["reports"] = locations
+    if summary["command"] == "init":
+        return summary
+    summary["generated_at"] = utcnow()
+    locations["summary"] = f"{base}-summary.json"
+    latest = {r["path_id"]: r for r in db.execute("""SELECT t.* FROM transfers t WHERE t.state='downloaded'
+        AND t.id=(SELECT MAX(t2.id) FROM transfers t2 WHERE t2.path_id=t.path_id AND t2.state='downloaded')""")}
+    paths = {r["id"]: r for r in db.execute("SELECT * FROM paths")}
+    if verification_run:
+        staged, present = _verify_staging(state, verification_run, latest, paths)
+        try:
+            staged_bytes = footprint(cfg)
+            with state.transaction():
+                state.resolve(verification_run, "", ["local_layout"])
+        except (OSError, PathError) as exc:
+            staged_bytes = None
+            state.error(verification_run, "", "local_layout", category(exc), exc)
+    else:
+        staged = list(saved_rows(state, run, "staging"))
+        present_paths = {row["remote_path"] for row in staged}
+        present = {key for key, row in paths.items() if row["remote"] in present_paths}
+        staged_bytes = summary.get("current_staged_bytes")
+    current_errors = [dict(row) for row in db.execute("""SELECT * FROM errors WHERE operation IN ('local','local_layout')
+        AND resolved_at IS NULL ORDER BY id""")]
+    summary["current_staging"] = {"verified_at": utcnow(), "completed_pdfs": len(staged),
+                                  "staged_bytes": staged_bytes, "free_bytes": shutil.disk_usage(cfg.export).free,
+                                  "integrity_errors": current_errors}
+
+    def payload_status(row):
+        if not row.get("sha256"):
+            return "not_applicable"
+        path = next_path.get(row["remote_path"])
+        success = latest.get(path["id"]) if path else None
+        if path and path["id"] in present:
+            return "staged" if success["id"] == row["transfer_id"] else "replaced"
+        if path:
+            try:
+                safe_target(cfg.export, path["local"]).lstat()
+            except FileNotFoundError:
+                return "absent"
+            except (OSError, PathError):
+                pass
+        return "unverified"
+    next_path = {p["remote"]: p for p in paths.values()}
+    if summary["original_results_available"]:
+        for report in db.execute("SELECT report,fields FROM result_reports WHERE run_id=? ORDER BY report", (run,)):
+            name = report["report"]
+            if name == "staging":
+                continue
+            def rows(name=name):
+                for row in saved_rows(state, run, name):
+                    if name == "documents":
+                        row["local_payload_status"] = payload_status(row)
+                    yield row
+            locations.setdefault(name, f"{base}-{name.replace('_', '-')}.csv")
+            csv_file(Path(locations[name]), json.loads(report["fields"]), rows())
+    elif summary["discovery_mode"] == "csv":
+        # Partial import diagnostics are reliable even though no final document
+        # outcomes exist. Status never accepts or resumes this input.
+        locations["import_errors"] = f"{base}-import-errors.csv"
+        csv_file(Path(locations["import_errors"]), ["row_number", "category", "message"],
+                 db.execute("SELECT row_number,category,message FROM csv_import_errors WHERE run_id=? ORDER BY id", (run,)))
+        if summary.get("import_status") == "accepted":
+            from .csv_results import DOCUMENT_FIELDS
+            locations["documents"] = f"{base}-documents.csv"
+            csv_file(Path(locations["documents"]), DOCUMENT_FIELDS + ["result_status"], db.execute("""SELECT e.*,
+                p.local AS mapped_path,o.size,o.mtime,'Original completion result unavailable' AS result_status
+                FROM csv_entries e LEFT JOIN paths p ON p.id=e.path_id LEFT JOIN observations o
+                ON o.run_id=e.run_id AND o.path_id=e.path_id WHERE e.run_id=? ORDER BY e.row_number""", (run,)))
+
+    fields = ["remote_path", "mapped_path", "size", "mtime", "sha256", "completed_at", "completion_run", "transfer_id", "forced"]
+    locations["staging"] = f"{base}-staging.csv"
+    csv_file(Path(locations["staging"]), fields, staged)
+
+    locations["history"] = f"{base}-history.csv"
+    csv_file(Path(locations["history"]), fields + ["payload_status"], _history_rows(state, latest, paths, present))
+    if not summary["original_results_available"]:
+        locations["downloads"] = f"{base}-downloads.csv"
+        csv_file(Path(locations["downloads"]), fields + ["payload_status"],
+                 (row for row in _history_rows(state, latest, paths, present) if row["completion_run"] == run))
+    locations["path_map"] = str(cfg.reports / "path-map.csv")
+    csv_file(Path(locations["path_map"]), ["remote_path", "mapped_path", "kind", "last_seen_run"],
+             (dict(p, remote_path=p["remote"], mapped_path=p["local"]) for p in paths.values()))
+    locations["current_integrity"] = f"{base}-current-integrity.csv"
+    csv_file(Path(locations["current_integrity"]), ["run_id", "timestamp", "remote", "operation", "category", "message"], current_errors)
+    atomic_write(Path(locations["summary"]), lambda f: json.dump(summary, f, indent=2))
     return summary
 
 

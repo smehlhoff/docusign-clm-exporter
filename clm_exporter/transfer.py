@@ -68,8 +68,13 @@ class Transfers:
         try:
             size = temp.lstat().st_size
         except FileNotFoundError:
-            return
-        temp.unlink()
+            size = 0
+        else:
+            temp.unlink()
+        # Commit the unlink before the database can forget the temporary path.
+        # Sync even when absent: a previous attempt may have unlinked it but
+        # failed its directory sync, leaving the deletion uncommitted on disk.
+        sync_directory(self.cfg.work)
         self.capacity.removed(size)
 
     def get_job(self, job_id: int) -> Row:
@@ -148,8 +153,8 @@ class Transfers:
             self._queue_forced_path(force_path)
         paths = self.db.execute("""SELECT p.* FROM paths p JOIN transfers t ON t.path_id=p.id
             WHERE p.last_seen_run=? AND p.selected=1 AND p.local IS NOT NULL
-              AND p.size IS NOT NULL AND p.mtime IS NOT NULL AND t.state IN ('pending','failed')
-            ORDER BY p.remote COLLATE BINARY""", (self.run,)).fetchall()
+              AND p.size IS NOT NULL AND p.mtime IS NOT NULL AND t.state IN ('pending','failed')"""
+            + self.state.scope_clause(self.run, "p") + " ORDER BY p.remote COLLATE BINARY", (self.run,)).fetchall()
         with self.progress.bar(desc="Files processed", total=len(paths), unit="file", position=0) as bar:
             for path in paths:
                 self.download_file(path)
@@ -160,7 +165,7 @@ class Transfers:
     def _queue_forced_path(self, force_path: str) -> None:
         """Queue an explicit repeat or record why the current scan cannot supply it."""
         path = self.db.execute(
-            "SELECT * FROM paths WHERE remote=? AND last_seen_run=? AND selected=1",
+            "SELECT * FROM paths WHERE remote=? AND last_seen_run=? AND selected=1" + self.state.scope_clause(self.run),
             (force_path, self.run),
         ).fetchone()
         if path is None or path["size"] is None or path["mtime"] is None:
@@ -222,6 +227,34 @@ class Transfers:
             if latest is None or digest_file(target) != (latest["size"], latest["sha256"]):
                 raise PathError(f"Refusing untracked or modified local target: {path['local']}")
 
+    def _record_transfer_failure(self, job: Row, path: Row, attempt: int, exc: Exception) -> bool:
+        """Preserve durable payloads; return whether connection recovery is needed.
+
+        The caller must refresh the job after the failure: an exception can
+        arrive after the ready commit but before its in-memory row is updated.
+        Reconnection stays with each scheduler, which owns its network thread.
+        """
+        ready = job["state"] in ("ready", "downloaded")
+        if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+            if not ready:
+                self.discard(job, "pending")
+            raise CapacityStop("disk_reserve") from exc
+        if ready:
+            self.state.error(self.run, path["remote"], "recovery", category(exc), exc, attempt)
+            LOG.error("Promotion failed for %r: %s", path["remote"], exc)
+            return False
+        self.discard(job, "failed", str(exc))
+        self.state.error(self.run, path["remote"], "transfer", category(exc), exc, attempt)
+        LOG.warning("Transfer attempt %d failed for %r: %s", attempt, path["remote"], exc)
+        return True
+
+    def _retry_allowed(self, exc: Exception, attempt: int) -> bool:
+        if isinstance(exc, (PermissionError, FileNotFoundError, MetadataError, PathError)):
+            return False
+        if isinstance(exc, OSError) and exc.errno == errno.ENAMETOOLONG:
+            return False
+        return attempt != self.cfg.max_attempts
+
     def download_file(self, path: Row) -> None:
         """Retry a pending file while retaining any durable ready payload."""
         job = self.db.execute("SELECT * FROM transfers WHERE path_id=? AND state IN ('pending','failed')", (path["id"],)).fetchone()
@@ -259,23 +292,10 @@ class Transfers:
                 raise
             except (OSError, EOFError, MetadataError, PathError, SourceChanged) as exc:
                 job = self.get_job(job["id"])
-                ready = job["state"] in ("ready", "downloaded")
-                if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
-                    if not ready:
-                        self.discard(job, "pending")
-                    raise CapacityStop("disk_reserve") from exc
-                if ready:
-                    # Never destroy a durable ready payload because promotion failed.
-                    self.state.error(self.run, path["remote"], "recovery", category(exc), exc, attempt)
-                    LOG.error("Promotion failed for %r: %s", path["remote"], exc)
+                if not self._record_transfer_failure(job, path, attempt, exc):
                     return
-                self.discard(job, "failed", str(exc))
-                self.state.error(self.run, path["remote"], "transfer", category(exc), exc, attempt)
-                LOG.warning("Transfer attempt %d failed for %r: %s", attempt, path["remote"], exc)
                 self.remote.reconnect(exc)
-                if (isinstance(exc, (PermissionError, FileNotFoundError, MetadataError, PathError))
-                        or isinstance(exc, OSError) and exc.errno == errno.ENAMETOOLONG
-                        or attempt == self.cfg.max_attempts):
+                if not self._retry_allowed(exc, attempt):
                     return
                 self.sleep(attempt)
 

@@ -66,7 +66,7 @@ def _scan(state: State, remote, run: str, sleep: Callable[[int], None], bar) -> 
                 enumerate_directory(remote, directory, attempt, apply)
                 directory_ok = True
                 with state.transaction():
-                    state.resolve(run, directory, ["directory"])
+                    state.resolve(run, directory, ["directory", "csv_ancestor"])
                 break
             except (OSError, EOFError, MetadataError) as exc:
                 remote.reconnect(exc)
@@ -243,7 +243,7 @@ def _save_observations(state: State, run: str, batch, *, queue_directories=False
             if verified_non_directory:
                 # Only explicit type metadata can retire a failed directory
                 # check; a PDF suffix alone does not establish that it is a file.
-                state.resolve(run, relative, ["directory"])
+                state.resolve(run, relative, ["directory", "csv_ancestor"])
             if prior and prior["kind"] != kind and prior["kind"] in ("file", "directory"):
                 # The old mapping stays reserved; ownership checks govern reuse.
                 LOG.warning("Remote entry changed type: %r", relative)
@@ -267,16 +267,23 @@ def _record_unavailable_paths(state: State, run: str) -> None:
             parent = parent.rpartition("/")[0]
         return scan_states.get(parent) == "complete"
 
-    # A removed directory no longer needs scanning. Retire its old scan errors
-    # only when the current enumeration proves absence; unfinished PDFs below
-    # it are still reported independently as unavailable.
-    missing_directories = db.execute("""SELECT p.* FROM paths p WHERE p.last_seen_run<>?
+    # Removed entries no longer need metadata, mapping or directory checks.
+    # Retire those errors only when enumeration proves absence; unfinished
+    # PDFs are still reported independently as unavailable below.
+    missing_entries = db.execute("""SELECT p.* FROM paths p WHERE (p.last_seen_run IS NULL OR p.last_seen_run<>?)
         AND EXISTS(SELECT 1 FROM errors e WHERE e.remote=p.remote
-                   AND e.operation='directory' AND e.resolved_at IS NULL)""", (run,)).fetchall()
+                   AND e.operation IN ('metadata','mapping','directory','csv_ancestor') AND e.resolved_at IS NULL)""", (run,)).fetchall()
     with state.transaction():
-        for path in missing_directories:
+        for path in missing_entries:
             if absence_proven(path):
-                state.resolve(run, path["remote"], ["directory"])
+                state.resolve(run, path["remote"], ["metadata", "mapping", "directory", "csv_ancestor"])
+        # Unsafe names never enter paths, so absence cannot be established for
+        # their individual parents. Only a complete, clean recursive scan can
+        # retire those old diagnostics. The failure history remains available.
+        if _scan_complete(state, run):
+            db.execute("""UPDATE errors SET resolved_at=?,resolved_run=?
+                WHERE operation='metadata' AND category='unsafe_remote_path'
+                  AND run_id<>? AND resolved_at IS NULL""", (utcnow(), run, run))
 
     # The current selected flag can disappear when a PDF changes type. Retain
     # unfinished work even when an older version was successfully downloaded.
@@ -295,7 +302,8 @@ def _record_unavailable_paths(state: State, run: str) -> None:
 def _schedule_transfers(state: State, run: str) -> None:
     """Update jobs for current metadata inside the caller's transaction."""
     db = state.db
-    for path in db.execute("SELECT * FROM paths WHERE selected=1 AND last_seen_run=? AND size IS NOT NULL AND mtime IS NOT NULL", (run,)).fetchall():
+    for path in db.execute("SELECT * FROM paths WHERE selected=1 AND last_seen_run=? AND size IS NOT NULL AND mtime IS NOT NULL"
+                           + state.scope_clause(run), (run,)):
         latest = state.latest(path["id"])
         if latest is None or (latest["size"], latest["mtime"]) != (path["size"], path["mtime"]):
             state.job(path, run)
@@ -402,7 +410,7 @@ def _scan_parallel(state, pool, run, sleep, bar):
                 return
         with state.transaction():
             if exc is None:
-                state.resolve(run, directory, ["directory"])
+                state.resolve(run, directory, ["directory", "csv_ancestor"])
             db.execute("UPDATE scans SET state=? WHERE run_id=? AND remote=?",
                        ("complete" if exc is None else "failed", run, directory))
         processed += 1

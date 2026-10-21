@@ -23,6 +23,26 @@ from clm_exporter.remote import Remote
 
 @unittest.skipUnless(importlib.util.find_spec("paramiko"), "Paramiko is not installed; real protocol tests unavailable")
 class ProtocolTests(unittest.TestCase):
+    def test_rsa_verification_rejects_sha1_signatures(self):
+        import paramiko as p
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        pem = key.private_bytes(serialization.Encoding.PEM,
+                                serialization.PrivateFormat.TraditionalOpenSSL,
+                                serialization.NoEncryption())
+        verifier = p.RSAKey.from_private_key(io.StringIO(pem.decode()))
+        data = b"local SSH signature regression fixture"
+        for algorithm, digest, accepted in (("ssh-rsa", hashes.SHA1(), False),
+                                             ("rsa-sha2-256", hashes.SHA256(), True),
+                                             ("rsa-sha2-512", hashes.SHA512(), True)):
+            with self.subTest(algorithm=algorithm):
+                message = p.Message()
+                message.add_string(algorithm)
+                message.add_string(key.sign(data, padding.PKCS1v15(), digest))
+                self.assertEqual(verifier.verify_ssh_sig(data, p.Message(message.asbytes())), accepted)
+
     def test_invalid_status_text_is_a_reportable_metadata_error(self):
         import paramiko as p
         from paramiko.sftp import (
@@ -137,7 +157,7 @@ class ProtocolTests(unittest.TestCase):
                 self.assertEqual(closes[0].args, (CMD_CLOSE, b"handle"))
 
     def exercise(self, trust="trusted", password=None, accepted=True, stall=None, invalid_name=False,
-                 reported_mode=None, directory_mode=None, workers=1, invalid_status=False):
+                 reported_mode=None, directory_mode=None, workers=1, invalid_status=False, csv_mode=False):
         import paramiko as p
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -204,6 +224,8 @@ class ProtocolTests(unittest.TestCase):
                 stat = lstat
 
                 def list_folder(self, path):
+                    if csv_mode:
+                        raise AssertionError("CSV discovery must not enumerate or probe directories")
                     if (source / path.lstrip("/")).is_file():
                         # SFTP v3 servers may reject OPENDIR on a file using
                         # either generic FAILURE or NO_SUCH_FILE.
@@ -228,6 +250,10 @@ class ProtocolTests(unittest.TestCase):
 
             cfg = Config("sftp.test", "operator", key_path, known, "/", root / "working", min_free_bytes=0,
                          max_attempts=1 if stall else 3, read_timeout_seconds=1 if stall else 60, workers=workers)
+            csv_path = root / "input.csv" if csv_mode else None
+            if csv_path:
+                csv_path.write_text("DOCUMENT ID,DOCUMENT NAME,LOCATION PATH\n" + "".join(
+                    f"id-{index},{Path(path).name},/{Path(path).parent.as_posix().strip('.')}\n" for index, path in enumerate(pdfs)))
             with redirect_stderr(io.StringIO()):
                 execute(cfg, "init")
             servers, sockets, threads = [], [], []
@@ -264,7 +290,7 @@ class ProtocolTests(unittest.TestCase):
                     patch("getpass.getpass", return_value=password) as prompt,
                     redirect_stderr(io.StringIO()) as stderr,
                 ):
-                    code, summary = execute(cfg, "download", sleep=lambda _: None)
+                    code, summary = execute(cfg, "download", sleep=lambda _: None, csv_path=csv_path)
                 if password:
                     prompt.assert_called_once()
                 else:
@@ -297,7 +323,7 @@ class ProtocolTests(unittest.TestCase):
                     for relative in pdfs:
                         self.assertEqual((cfg.export / relative).read_bytes(), (source / relative).read_bytes())
                     if directory_mode is not None:
-                        self.assertEqual(summary["directories_discovered"], 6)
+                        self.assertEqual(summary["directories_discovered"], 0 if csv_mode else 6)
                 else:
                     self.assertEqual(code, 1)
                     self.assertEqual(summary["stop_reason"], "fatal_error")
@@ -323,6 +349,12 @@ class ProtocolTests(unittest.TestCase):
 
     def test_multiple_sessions_share_one_encrypted_key_initialization(self):
         self.exercise(workers=2, directory_mode=0o140750, password="test-only-passphrase")
+
+    def test_csv_direct_checks_over_real_sftp_sessions(self):
+        for workers in (1, 2):
+            with self.subTest(workers=workers):
+                self.exercise(workers=workers, directory_mode=0o140750, reported_mode=0o140640,
+                              password="test-only-passphrase", csv_mode=True)
 
     def test_nested_transfer_with_clm_special_types(self):
         for directory_mode in (0o140750, 0o750):
