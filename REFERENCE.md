@@ -131,6 +131,23 @@ default configuration. Commands other than `init` produce `run-<id>.log`,
 `run-<id>-summary.json`, and the following CSVs. All commands also print a JSON
 summary to stdout; `status --run-id` rewrites reports for the specified run.
 
+By default, only **staging, gaps, unresolved, and documents (CSV mode)** are
+published. Import-errors and current-integrity CSVs are added only when errors
+exist. `summary.json` and stdout show a compact view of completion, row/path
+counts, transfers, outstanding work, staging integrity, and publication failures.
+The compact view includes `source.remote_root` and, for CSV mode, `input_source`
+(the input CSV path). `pdfs_with_unknown_size` and `zero_byte_pdfs` count distinct
+paths, not repeated CSV rows. Unknown sizes do not contribute to byte totals;
+a zero pending-byte total does not establish that all files are downloaded.
+`directories_discovered` counts observed directories beneath the configured root,
+excluding the root itself. In CSV mode, only explicitly identified ancestor
+directories of listed files count; unrelated folders are not scanned.
+Add `--full-reports` for the complete CSV list below and detailed summary.
+Full results remain in SQLite and can be published later using
+`status --config config.toml --run-id <id> --full-reports`, without SFTP access.
+Previously generated files are not deleted. The Python `execute()` API retains
+its detailed default; use `full_reports=False` for compact file publication.
+
 | CSV | Contents |
 | --- | --- |
 | `run-<id>-staging.csv` | Completed PDFs currently on disk, verified by size and SHA-256; use for offloading |
@@ -145,7 +162,7 @@ summary to stdout; `status --run-id` rewrites reports for the specified run.
 | `run-<id>-import-errors.csv` | CSV validation diagnostics, with row numbers when available |
 | `run-<id>-current-integrity.csv` | Current local integrity errors, separate from saved historical outcomes |
 
-The three CSV input reports are produced for CSV mode. Its document outcomes are
+The three CSV input reports apply to CSV mode. Its document outcomes are
 `failed`, `unchecked`, `pending`, `downloaded_this_run`, and `previously_downloaded`.
 Their counts sum to the accepted input count. Unrelated historical errors remain
 visible with `in_current_scope=false` without blocking current CSV completion.
@@ -157,6 +174,14 @@ each path once; the gaps report also lists each outstanding path once. The
 absence report retains all rows whose path disappeared from the supplied list.
 Staging and history reports remain comprehensive for offloading. Zero-byte PDFs
 retain the existing successful-transfer behavior and review notice.
+
+In both summary formats, `pdfs_with_unknown_size` counts paths for which no
+size is recorded. In CSV mode this includes unchecked paths and failed metadata
+lookups; it is not a count of missing source files. `source_unavailable` is an
+error category for a source path that could not be found (including a file that
+disappeared after its size was observed). These can overlap but are not equivalent.
+Unknown sizes are excluded from known-byte totals, so those totals can understate
+remaining work. Consult document outcomes and unresolved errors for the cause.
 
 Full snapshots, results, transfer history, and backups are retained across runs.
 Backup storage grows with usage; remove older redundant backup copies manually

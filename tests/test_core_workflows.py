@@ -62,7 +62,8 @@ min_free_bytes = 0
 
         # A fresh process must load the persisted state without SFTP credentials.
         summary = json.loads(self.cli("status").stdout)
-        self.assertEqual(summary["historical_successful_transfers"], 0)
+        self.assertEqual(summary["current_staging"]["completed_pdfs"], 0)
+        self.assertNotIn("historical_successful_transfers", summary)
         self.assertEqual(self.report(summary, "staging"), [])
         self.assertTrue(Path(summary["reports"]["backup"]).is_file())
         saved = json.loads(Path(summary["reports"]["summary"]).read_text())

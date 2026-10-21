@@ -81,7 +81,7 @@ Using the default `export/` working directory, repeat for each batch:
 
 1. Run `download`, review its summary, then run `status` before offloading.
 2. Copy `export/CLM-export/` to a new archive folder, preserving its structure.
-   Include the latest `run-<id>-staging.csv` and `path-map.csv` from `export/reports/`.
+   Include the latest `run-<id>-staging.csv` from `export/reports/` (it includes both remote and local paths).
 3. Verify the archive upload and keep a separate backup of `export/state/`.
    Archive copying and verification are manual.
 4. With the exporter stopped, delete the archived local PDFs or `export/CLM-export/`.
@@ -95,6 +95,11 @@ against the same fresh, complete CLM report.
 
 ## Reference
 
-Logs, manifests, errors, and JSON summaries are in `export/reports/`. See the
+Logs, critical CSV reports, and compact JSON summaries are in `export/reports/`.
+Defaults are `staging`, `gaps`, `unresolved`, and (in CSV mode) `documents`.
+Validation and current-integrity CSVs appear only when they contain errors.
+Add `--full-reports` to any command for all diagnostic reports and the detailed
+summary, or reconstruct them offline with `status --run-id <id> --full-reports`.
+Existing report files are retained. See the
 [export reference](REFERENCE.md) for report definitions, CSV validation,
 recovery, state upgrades, command options, and development checks.

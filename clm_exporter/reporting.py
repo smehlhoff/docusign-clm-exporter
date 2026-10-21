@@ -302,13 +302,43 @@ def publication_summary(state, run, attempt):
             "publication": dict(current), "invocation_exit_code": current["exit_code"]}
 
 
-def write_reports(state, run, scan_run=None, backup_run=None, *, verification_run=None):
+# Keep the full durable result for reconstruction; publish a focused view by default.
+COMPACT_FIELDS = (
+    "run_id", "command", "discovery_mode", "started_at", "ended_at", "stop_reason",
+    "scan_status", "import_status", "input_source", "local_download_complete", "export_exit_code",
+    "invocation_exit_code", "original_results_available", "original_result_note",
+    "expected_document_count", "unique_path_count", "duplicate_row_count", "document_outcomes",
+    "directories_discovered", "pdfs_discovered", "latest_version_coverage", "new_successes", "changed_or_repeated_successes",
+    "downloaded_bytes", "pending_deferred_count", "pending_deferred_bytes",
+    "pdfs_with_unknown_size", "zero_byte_pdfs",
+    "unresolved_file_errors", "unresolved_directory_errors", "historical_unresolved_errors",
+    "reports",
+)
+
+
+def summary_view(summary, full_reports=True):
+    if full_reports:
+        return summary
+    result = {key: summary[key] for key in COMPACT_FIELDS if key in summary}
+    if "source" in summary:
+        result["source"] = {"remote_root": summary["source"]["remote_root"]}
+    if "current_staging" in summary:
+        result["current_staging"] = summary["current_staging"]
+    if "publication" in summary:
+        result["publication"] = {key: summary["publication"][key] for key in
+                                 ("reports_status", "backup_status", "diagnostic")}
+    return result
+
+
+def write_reports(state, run, scan_run=None, backup_run=None, *, verification_run=None, full_reports=True):
     """Publish saved coverage alongside a separate current staging assessment."""
     db, cfg = state.db, state.cfg
     summary = result_summary(state, run)
     summary.update(status_context(state))
     base = cfg.reports / f"run-{run}"
-    locations = dict(summary["reports"])
+    critical = {"documents", "staging", "gaps", "unresolved", "import_errors", "current_integrity"}
+    locations = {key: value for key, value in summary["reports"].items()
+                 if full_reports or key in critical | {"summary", "log", "backup"}}
     locations["backup"] = str(cfg.backups / f"export-{backup_run or run}.sqlite3")
     summary["reports"] = locations
     if summary["command"] == "init":
@@ -357,7 +387,12 @@ def write_reports(state, run, scan_run=None, backup_run=None, *, verification_ru
     if summary["original_results_available"]:
         for report in db.execute("SELECT report,fields FROM result_reports WHERE run_id=? ORDER BY report", (run,)):
             name = report["report"]
-            if name == "staging":
+            if name == "staging" or not full_reports and name not in critical:
+                continue
+            if not full_reports and name == "import_errors" and not db.execute(
+                "SELECT 1 FROM result_rows WHERE run_id=? AND report=? LIMIT 1", (run, name)
+            ).fetchone():
+                locations.pop(name, None)
                 continue
             def rows(name=name):
                 for row in saved_rows(state, run, name):
@@ -369,9 +404,10 @@ def write_reports(state, run, scan_run=None, backup_run=None, *, verification_ru
     elif summary["discovery_mode"] == "csv":
         # Partial import diagnostics are reliable even though no final document
         # outcomes exist. Status never accepts or resumes this input.
-        locations["import_errors"] = f"{base}-import-errors.csv"
-        csv_file(Path(locations["import_errors"]), ["row_number", "category", "message"],
-                 db.execute("SELECT row_number,category,message FROM csv_import_errors WHERE run_id=? ORDER BY id", (run,)))
+        if full_reports or db.execute("SELECT 1 FROM csv_import_errors WHERE run_id=? LIMIT 1", (run,)).fetchone():
+            locations["import_errors"] = f"{base}-import-errors.csv"
+            csv_file(Path(locations["import_errors"]), ["row_number", "category", "message"],
+                     db.execute("SELECT row_number,category,message FROM csv_import_errors WHERE run_id=? ORDER BY id", (run,)))
         if summary.get("import_status") == "accepted":
             from .csv_results import DOCUMENT_FIELDS
             locations["documents"] = f"{base}-documents.csv"
@@ -384,18 +420,20 @@ def write_reports(state, run, scan_run=None, backup_run=None, *, verification_ru
     locations["staging"] = f"{base}-staging.csv"
     csv_file(Path(locations["staging"]), fields, staged)
 
-    locations["history"] = f"{base}-history.csv"
-    csv_file(Path(locations["history"]), fields + ["payload_status"], _history_rows(state, latest, paths, present))
-    if not summary["original_results_available"]:
-        locations["downloads"] = f"{base}-downloads.csv"
-        csv_file(Path(locations["downloads"]), fields + ["payload_status"],
-                 (row for row in _history_rows(state, latest, paths, present) if row["completion_run"] == run))
-    locations["path_map"] = str(cfg.reports / "path-map.csv")
-    csv_file(Path(locations["path_map"]), ["remote_path", "mapped_path", "kind", "last_seen_run"],
-             (dict(p, remote_path=p["remote"], mapped_path=p["local"]) for p in paths.values()))
-    locations["current_integrity"] = f"{base}-current-integrity.csv"
-    csv_file(Path(locations["current_integrity"]), ["run_id", "timestamp", "remote", "operation", "category", "message"], current_errors)
-    atomic_write(Path(locations["summary"]), lambda f: json.dump(summary, f, indent=2))
+    if full_reports:
+        locations["history"] = f"{base}-history.csv"
+        csv_file(Path(locations["history"]), fields + ["payload_status"], _history_rows(state, latest, paths, present))
+        if not summary["original_results_available"]:
+            locations["downloads"] = f"{base}-downloads.csv"
+            csv_file(Path(locations["downloads"]), fields + ["payload_status"],
+                     (row for row in _history_rows(state, latest, paths, present) if row["completion_run"] == run))
+        locations["path_map"] = str(cfg.reports / "path-map.csv")
+        csv_file(Path(locations["path_map"]), ["remote_path", "mapped_path", "kind", "last_seen_run"],
+                 (dict(p, remote_path=p["remote"], mapped_path=p["local"]) for p in paths.values()))
+    if full_reports or current_errors:
+        locations["current_integrity"] = f"{base}-current-integrity.csv"
+        csv_file(Path(locations["current_integrity"]), ["run_id", "timestamp", "remote", "operation", "category", "message"], current_errors)
+    atomic_write(Path(locations["summary"]), lambda f: json.dump(summary_view(summary, full_reports), f, indent=2))
     return summary
 
 

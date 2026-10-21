@@ -19,6 +19,7 @@ from .reporting import (
     publication_summary,
     result_summary,
     status_context,
+    summary_view,
     write_reports,
 )
 from .state import State, utcnow
@@ -34,6 +35,7 @@ def parser():
         sub = commands.add_parser(command)
         sub.add_argument("--config", required=True, type=Path)
         sub.add_argument("--no-progress", action="store_true", help="Disable terminal progress bars (logs remain enabled)")
+        sub.add_argument("--full-reports", action="store_true", help="Publish all diagnostic CSVs and the detailed JSON summary")
         if command in ("inventory", "download", "reconcile"):
             sub.add_argument("--csv", type=Path, help="Complete CSV document list; paths resolve from the invocation directory")
         if command == "download":
@@ -43,7 +45,7 @@ def parser():
     return result
 
 
-def execute(cfg, command, force_path=None, report_run=None, remote_factory=Remote, free=None, sleep=None, checkpoint=None, progress=True, csv_path=None):
+def execute(cfg, command, force_path=None, report_run=None, remote_factory=Remote, free=None, sleep=None, checkpoint=None, progress=True, csv_path=None, full_reports=True):
     """CLI engine; transport and disk readings are injectable for acceptance tests."""
     if force_path is not None:
         relative_parts(force_path)
@@ -64,7 +66,7 @@ def execute(cfg, command, force_path=None, report_run=None, remote_factory=Remot
                     raise FatalError(f"Unknown run id: {report_run}")
                 backup_run = report_run + "-reconstructed-" + str(time.time_ns())
                 verification_run = state.run("status", previous["discovery_mode"])
-                code, summary = publish(state, report_run, backup_run=backup_run, verification_run=verification_run)
+                code, summary = publish(state, report_run, backup_run=backup_run, verification_run=verification_run, full_reports=full_reports)
                 with state.transaction():
                     state.db.execute("UPDATE runs SET ended_at=?,stop_reason=? WHERE id=?",
                                      (utcnow(), "completed" if code == 0 else "publication_or_export_error", verification_run))
@@ -144,7 +146,7 @@ def execute(cfg, command, force_path=None, report_run=None, remote_factory=Remot
             except (OSError, sqlite3.Error, PathError, KeyboardInterrupt) as exc:
                 code = 130 if isinstance(exc, KeyboardInterrupt) else 1
                 LOG.error("Could not finalize export results: %s", exc)
-            return publish(state, run, exit_override=code)
+            return publish(state, run, exit_override=code, full_reports=full_reports)
         finally:
             for handler in handlers:
                 LOG.removeHandler(handler)
@@ -152,7 +154,7 @@ def execute(cfg, command, force_path=None, report_run=None, remote_factory=Remot
             state.close()
 
 
-def publish(state, run, *, backup_run=None, verification_run=None, exit_override=None):
+def publish(state, run, *, backup_run=None, verification_run=None, exit_override=None, full_reports=True):
     """Report and backup failures never rewrite a finalized export result."""
     db = state.db
     with state.transaction():
@@ -177,7 +179,7 @@ def publish(state, run, *, backup_run=None, verification_run=None, exit_override
                        ("interrupted" if interrupted else "failed", "; ".join(diagnostics), attempt))
 
     try:
-        summary = write_reports(state, run, backup_run=backup_run, verification_run=verification_run)
+        summary = write_reports(state, run, backup_run=backup_run, verification_run=verification_run, full_reports=full_reports)
         with state.transaction():
             db.execute("UPDATE publication_attempts SET reports_status='complete' WHERE id=?", (attempt,))
     except (OSError, sqlite3.Error, PathError, KeyboardInterrupt) as exc:
@@ -206,7 +208,7 @@ def publish(state, run, *, backup_run=None, verification_run=None, exit_override
     finish_view()
     if summary["publication"]["reports_status"] == "complete" and "summary" in summary["reports"]:
         try:
-            atomic_write(Path(summary["reports"]["summary"]), lambda stream: json.dump(summary, stream, indent=2))
+            atomic_write(Path(summary["reports"]["summary"]), lambda stream: json.dump(summary_view(summary, full_reports), stream, indent=2))
         except (OSError, PathError, KeyboardInterrupt) as exc:
             failure("reports", exc)
             summary.update(publication_summary(state, run, attempt))
@@ -222,14 +224,14 @@ def main(argv=None):
     try:
         cfg = load(args.config)
         code, summary = execute(cfg, args.command, getattr(args, "force_path", None), getattr(args, "run_id", None),
-                                progress=not args.no_progress, csv_path=getattr(args, "csv", None))
+                                progress=not args.no_progress, csv_path=getattr(args, "csv", None), full_reports=args.full_reports)
         if args.command == "init":
             if code == 0:
                 print("Initialized.")
             else:
                 print("Initialization interrupted." if code == 130 else "Initialization failed.", file=sys.stderr)
         else:
-            print(json.dumps(summary, indent=2))
+            print(json.dumps(summary_view(summary, args.full_reports), indent=2))
         return code
     except KeyboardInterrupt:
         return 130
