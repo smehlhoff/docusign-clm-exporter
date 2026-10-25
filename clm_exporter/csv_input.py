@@ -63,8 +63,6 @@ def _strict_lines(stream):
 
 def resolve_path(root, name, location):
     component(name)
-    if not name.casefold().endswith(".pdf"):
-        raise ValueError("Document Name must end in .pdf")
     if not location.startswith("/") or "\\" in location or "\x00" in location:
         raise ValueError("Location Path must be an absolute POSIX folder path")
     if "//" in location:

@@ -95,6 +95,26 @@ class CsvExportTests(unittest.TestCase):
         doc = self.report(summary)[0]
         self.assertEqual((doc["document_id"], doc["document_name"], doc["location_path"]), (" ID  ", "a, β.PdF", "/Main/é/"))
 
+    def test_names_without_pdf_suffix_download_and_skip_on_repeat(self):
+        names = ["Agreement", "contract.final", "a.txt"]
+        with self.source.open("w", newline="") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(["DOCUMENT ID", "DOCUMENT NAME", "LOCATION PATH", "EXTENSION"])
+            for index, name in enumerate(names):
+                writer.writerow([f"id-{index}", name, "/Main", "pdf"])
+                self.remote.add(name)
+        code, summary = self.run_csv()
+        self.assertEqual(code, 0)
+        self.assertTrue(summary["local_download_complete"])
+        self.assertCountEqual(self.remote.opens, names)
+        self.assertCountEqual([row["document_name"] for row in self.report(summary)], names)
+        for name in names:
+            self.assertEqual((self.cfg.export / name).read_bytes(), b"pdf")
+        code, summary = self.run_csv()
+        self.assertEqual(code, 0)
+        self.assertEqual(summary["unchanged_skips"], len(names))
+        self.assertEqual(len(self.remote.opens), len(names))
+
     def test_large_extra_column_is_ignored_without_changing_csv_reader_limit(self):
         self.source.write_text("DOCUMENT ID,DOCUMENT NAME,LOCATION PATH,DETAILS\nid,a.pdf,/Main," + "x" * 200000 + "\n")
         self.remote.add("a.pdf")
@@ -105,7 +125,7 @@ class CsvExportTests(unittest.TestCase):
         self.assertEqual(summary["expected_document_count"], 1)
 
     def test_parse_failure_preserves_earlier_buffered_row_diagnostics(self):
-        self.source.write_text('DOCUMENT ID,DOCUMENT NAME,LOCATION PATH\nid,a.txt,/Main\nid,"broken.pdf,/Main\n')
+        self.source.write_text('DOCUMENT ID,DOCUMENT NAME,LOCATION PATH\nid,../a.pdf,/Main\nid,"broken.pdf,/Main\n')
         code, summary = self.run_csv()
         self.assertEqual(code, 1)
         self.assertEqual([row["category"] for row in self.report(summary, "import_errors")], ["invalid_row", "invalid_csv"])
@@ -135,7 +155,7 @@ class CsvExportTests(unittest.TestCase):
             "", header, "ID,NAME,PATH\na,a.pdf,/Main\n", "DOCUMENT ID,DOCUMENT NAME,LOCATION PATH,document id\na,a.pdf,/Main,b\n",
             header + "id,a.pdf,/Main,extra\n",
             header + 'id,"a.pdf,/Main\n', header + 'id,a".pdf,/Main\n', header + 'id,"a.pdf"bad,/Main\n',
-            header + "id,a.pdf,/MainArchive\n", header + "id,a.txt,/Main\n", header + " ,a.pdf,/Main\n",
+            header + "id,a.pdf,/MainArchive\n", header + " ,a.pdf,/Main\n",
             header + "id,../a.pdf,/Main\n", header + "id,a.pdf,Main\n", header + "id,a.pdf,/Main//X\n",
             header + "id,a.pdf,/Main/./X\n", header + "id,a.pdf,/Main/../Main\n", header + "id,a.pdf,/Main\\X\n",
             header + "id,a.pdf,/Main///\n", header + "id,a.pdf,/Main\x00\n",

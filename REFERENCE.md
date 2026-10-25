@@ -53,8 +53,10 @@ D02DC5F5-466A-43C0-95A8-A6B9F05C5F1F,test.pdf,/Main/Contracts/
 ```
 
 This row selects `/Main/Contracts/test.pdf`. Locations are absolute SFTP paths
-beneath your configured `remote_root`; names must include `.pdf` and be a single
-safe path component. Names and IDs retain their original spelling. Repeated
+beneath your configured `remote_root`; names must be a single safe path component
+matching the remote filename. CSV mode does not require a `.pdf` suffix or use
+the report's extension column to filter files or append an extension. Every
+listed document is selected for export. Names and IDs retain their original spelling. Repeated
 resolved paths are accepted: each unique, case-sensitive SFTP path is checked
 and downloaded once, and every matching CSV row retains its document ID and
 references the same transfer in the results. Different IDs at the same path
